@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use crate::insn::Handle;
+use std::collections::HashMap;
 
 /// A builder for the constant pool of a class.
 ///
@@ -63,9 +63,9 @@ impl ConstantPoolBuilder {
         fn cp_name_and_type(cp: &[CpInfo], index: u16) -> Option<(&str, &str)> {
             match cp.get(index as usize) {
                 Some(CpInfo::NameAndType {
-                         name_index,
-                         descriptor_index,
-                     }) => {
+                    name_index,
+                    descriptor_index,
+                }) => {
                     let name = cp_utf8(cp, *name_index)?;
                     let desc = cp_utf8(cp, *descriptor_index)?;
                     Some((name, desc))
@@ -74,31 +74,28 @@ impl ConstantPoolBuilder {
             }
         }
 
-        fn cp_member_ref(
-            cp: &[CpInfo],
-            index: u16,
-        ) -> Option<(String, String, String, bool)> {
+        fn cp_member_ref(cp: &[CpInfo], index: u16) -> Option<(String, String, String, bool)> {
             match cp.get(index as usize) {
                 Some(CpInfo::Fieldref {
-                         class_index,
-                         name_and_type_index,
-                     }) => {
+                    class_index,
+                    name_and_type_index,
+                }) => {
                     let owner = cp_class_name(cp, *class_index)?.to_string();
                     let (name, desc) = cp_name_and_type(cp, *name_and_type_index)?;
                     Some((owner, name.to_string(), desc.to_string(), false))
                 }
                 Some(CpInfo::Methodref {
-                         class_index,
-                         name_and_type_index,
-                     }) => {
+                    class_index,
+                    name_and_type_index,
+                }) => {
                     let owner = cp_class_name(cp, *class_index)?.to_string();
                     let (name, desc) = cp_name_and_type(cp, *name_and_type_index)?;
                     Some((owner, name.to_string(), desc.to_string(), false))
                 }
                 Some(CpInfo::InterfaceMethodref {
-                         class_index,
-                         name_and_type_index,
-                     }) => {
+                    class_index,
+                    name_and_type_index,
+                }) => {
                     let owner = cp_class_name(cp, *class_index)?.to_string();
                     let (name, desc) = cp_name_and_type(cp, *name_and_type_index)?;
                     Some((owner, name.to_string(), desc.to_string(), true))
@@ -147,11 +144,7 @@ impl ConstantPoolBuilder {
                     ) {
                         builder
                             .field_ref
-                            .entry((
-                                owner.to_string(),
-                                name.to_string(),
-                                desc.to_string(),
-                            ))
+                            .entry((owner.to_string(), name.to_string(), desc.to_string()))
                             .or_insert(index);
                     }
                 }
@@ -165,11 +158,7 @@ impl ConstantPoolBuilder {
                     ) {
                         builder
                             .method_ref
-                            .entry((
-                                owner.to_string(),
-                                name.to_string(),
-                                desc.to_string(),
-                            ))
+                            .entry((owner.to_string(), name.to_string(), desc.to_string()))
                             .or_insert(index);
                     }
                 }
@@ -183,20 +172,13 @@ impl ConstantPoolBuilder {
                     ) {
                         builder
                             .interface_method_ref
-                            .entry((
-                                owner.to_string(),
-                                name.to_string(),
-                                desc.to_string(),
-                            ))
+                            .entry((owner.to_string(), name.to_string(), desc.to_string()))
                             .or_insert(index);
                     }
                 }
                 CpInfo::MethodType { descriptor_index } => {
                     if let Some(desc) = cp_utf8(&builder.cp, *descriptor_index) {
-                        builder
-                            .method_type
-                            .entry(desc.to_string())
-                            .or_insert(index);
+                        builder.method_type.entry(desc.to_string()).or_insert(index);
                     }
                 }
                 CpInfo::MethodHandle {
@@ -216,12 +198,15 @@ impl ConstantPoolBuilder {
                     bootstrap_method_attr_index,
                     name_and_type_index,
                 } => {
-                    if let Some((name, desc)) =
-                        cp_name_and_type(&builder.cp, *name_and_type_index)
+                    if let Some((name, desc)) = cp_name_and_type(&builder.cp, *name_and_type_index)
                     {
                         builder
                             .invoke_dynamic
-                            .entry((*bootstrap_method_attr_index, name.to_string(), desc.to_string()))
+                            .entry((
+                                *bootstrap_method_attr_index,
+                                name.to_string(),
+                                desc.to_string(),
+                            ))
                             .or_insert(index);
                     }
                 }
@@ -368,8 +353,7 @@ impl ConstantPoolBuilder {
         }
         let descriptor_index = self.utf8(descriptor);
         let index = self.push(CpInfo::MethodType { descriptor_index });
-        self.method_type
-            .insert(descriptor.to_string(), index);
+        self.method_type.insert(descriptor.to_string(), index);
         index
     }
 

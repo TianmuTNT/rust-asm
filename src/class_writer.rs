@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 
 use crate::class_reader::{
-    AttributeInfo, BootstrapMethod, CodeAttribute, ExceptionTableEntry, InnerClass,
-    LineNumber, LocalVariable, MethodParameter, StackMapFrame, VerificationTypeInfo,
+    Annotation, AttributeInfo, BootstrapMethod, CodeAttribute, ElementValue, ExceptionTableEntry,
+    InnerClass, LineNumber, LocalVariable, MethodParameter, ParameterAnnotations, StackMapFrame,
+    TypeAnnotation, TypeAnnotationTargetInfo, TypePath, VerificationTypeInfo,
 };
 use crate::constant_pool::{ConstantPoolBuilder, CpInfo};
 use crate::constants;
@@ -27,8 +28,6 @@ pub const COMPUTE_FRAMES: u32 = 0x1;
 /// When this flag is set, the writer will calculate `max_stack` and `max_locals`
 /// for methods, ignoring the values provided in `visit_maxs`.
 pub const COMPUTE_MAXS: u32 = 0x2;
-
-
 
 struct FieldData {
     access_flags: u16,
@@ -336,8 +335,9 @@ impl ClassWriter {
         {
             methods
         } else {
-            self.attributes
-                .push(AttributeInfo::BootstrapMethods { methods: Vec::new() });
+            self.attributes.push(AttributeInfo::BootstrapMethods {
+                methods: Vec::new(),
+            });
             if let Some(AttributeInfo::BootstrapMethods { methods }) = self.attributes.last_mut() {
                 methods
             } else {
@@ -674,20 +674,17 @@ impl MethodVisitor {
                     AbstractInsnNode::Insn(Insn::Type(insn))
                 }
                 AbstractInsnNode::Insn(Insn::InvokeDynamic(mut insn)) => {
-                    if insn.method_index == 0 {
-                        if let (Some(name), Some(descriptor), Some(bootstrap_method)) = (
+                    if insn.method_index == 0
+                        && let (Some(name), Some(descriptor), Some(bootstrap_method)) = (
                             insn.name.take(),
                             insn.descriptor.take(),
                             insn.bootstrap_method.take(),
-                        ) {
-                            let bsm_index = class.ensure_bootstrap_method(
-                                &bootstrap_method,
-                                &insn.bootstrap_args,
-                            );
-                            let method_index =
-                                class.cp.invoke_dynamic(bsm_index, &name, &descriptor);
-                            insn.method_index = method_index;
-                        }
+                        )
+                    {
+                        let bsm_index =
+                            class.ensure_bootstrap_method(&bootstrap_method, &insn.bootstrap_args);
+                        let method_index = class.cp.invoke_dynamic(bsm_index, &name, &descriptor);
+                        insn.method_index = method_index;
                     }
                     AbstractInsnNode::Insn(Insn::InvokeDynamic(insn))
                 }
@@ -1339,15 +1336,12 @@ fn resolve_ldc(node: LdcInsnNode, cp: &mut ConstantPoolBuilder) -> (u8, u16, Ldc
         }
         LdcValue::Type(value) => {
             let index = match value.clone() {
-                Type::Object(obj) => {
-                    cp.class(&obj)
-                },
-                Type::Method { argument_types: _, return_type: _ } => {
-                    cp.method_type(&value.clone().get_descriptor())
-                },
-                _ => {
-                    cp.class(&value.clone().get_descriptor())
-                }
+                Type::Object(obj) => cp.class(&obj),
+                Type::Method {
+                    argument_types: _,
+                    return_type: _,
+                } => cp.method_type(&value.clone().get_descriptor()),
+                _ => cp.class(&value.clone().get_descriptor()),
             };
             let opcode = if index <= 0xFF {
                 opcodes::LDC
@@ -1475,8 +1469,7 @@ impl ClassFileWriter {
 
         let mut precomputed_stack_maps: Vec<Option<Vec<StackMapFrame>>> =
             Vec::with_capacity(methods.len());
-        let mut precomputed_maxs: Vec<Option<(u16, u16)>> =
-            Vec::with_capacity(methods.len());
+        let mut precomputed_maxs: Vec<Option<(u16, u16)>> = Vec::with_capacity(methods.len());
         let compute_frames = self.options & COMPUTE_FRAMES != 0;
         let compute_maxs_flag = self.options & COMPUTE_MAXS != 0;
         if compute_frames {
@@ -1779,6 +1772,42 @@ fn write_attribute(
             }
             write_attribute_with_info(out, name_index, &info);
         }
+        AttributeInfo::RuntimeVisibleAnnotations { annotations } => {
+            let name_index = ensure_utf8(cp, "RuntimeVisibleAnnotations");
+            let mut info = Vec::new();
+            write_runtime_annotations(&mut info, annotations);
+            write_attribute_with_info(out, name_index, &info);
+        }
+        AttributeInfo::RuntimeInvisibleAnnotations { annotations } => {
+            let name_index = ensure_utf8(cp, "RuntimeInvisibleAnnotations");
+            let mut info = Vec::new();
+            write_runtime_annotations(&mut info, annotations);
+            write_attribute_with_info(out, name_index, &info);
+        }
+        AttributeInfo::RuntimeVisibleParameterAnnotations { parameters } => {
+            let name_index = ensure_utf8(cp, "RuntimeVisibleParameterAnnotations");
+            let mut info = Vec::new();
+            write_runtime_parameter_annotations(&mut info, parameters);
+            write_attribute_with_info(out, name_index, &info);
+        }
+        AttributeInfo::RuntimeInvisibleParameterAnnotations { parameters } => {
+            let name_index = ensure_utf8(cp, "RuntimeInvisibleParameterAnnotations");
+            let mut info = Vec::new();
+            write_runtime_parameter_annotations(&mut info, parameters);
+            write_attribute_with_info(out, name_index, &info);
+        }
+        AttributeInfo::RuntimeVisibleTypeAnnotations { annotations } => {
+            let name_index = ensure_utf8(cp, "RuntimeVisibleTypeAnnotations");
+            let mut info = Vec::new();
+            write_runtime_type_annotations(&mut info, annotations);
+            write_attribute_with_info(out, name_index, &info);
+        }
+        AttributeInfo::RuntimeInvisibleTypeAnnotations { annotations } => {
+            let name_index = ensure_utf8(cp, "RuntimeInvisibleTypeAnnotations");
+            let mut info = Vec::new();
+            write_runtime_type_annotations(&mut info, annotations);
+            write_attribute_with_info(out, name_index, &info);
+        }
         AttributeInfo::Unknown { name, info } => {
             let name_index = ensure_utf8(cp, name);
             write_attribute_with_info(out, name_index, info);
@@ -1786,6 +1815,153 @@ fn write_attribute(
     }
 
     Ok(())
+}
+
+fn write_runtime_annotations(out: &mut Vec<u8>, annotations: &[Annotation]) {
+    write_u2(out, annotations.len() as u16);
+    for a in annotations {
+        write_annotation(out, a);
+    }
+}
+
+fn write_runtime_parameter_annotations(out: &mut Vec<u8>, parameters: &ParameterAnnotations) {
+    // JVMS: u1 num_parameters
+    write_u1(out, parameters.parameters.len() as u8);
+    for anns in &parameters.parameters {
+        write_u2(out, anns.len() as u16);
+        for a in anns {
+            write_annotation(out, a);
+        }
+    }
+}
+
+fn write_runtime_type_annotations(out: &mut Vec<u8>, annotations: &[TypeAnnotation]) {
+    write_u2(out, annotations.len() as u16);
+    for ta in annotations {
+        write_type_annotation(out, ta);
+    }
+}
+
+fn write_annotation(out: &mut Vec<u8>, a: &Annotation) {
+    // u2 type_index
+    write_u2(out, a.type_descriptor_index);
+    // u2 num_element_value_pairs
+    write_u2(out, a.element_value_pairs.len() as u16);
+    for pair in &a.element_value_pairs {
+        write_u2(out, pair.element_name_index);
+        write_element_value(out, &pair.value);
+    }
+}
+
+fn write_element_value(out: &mut Vec<u8>, v: &ElementValue) {
+    match v {
+        ElementValue::ConstValueIndex {
+            tag,
+            const_value_index,
+        } => {
+            write_u1(out, *tag);
+            write_u2(out, *const_value_index);
+        }
+        ElementValue::EnumConstValue {
+            type_name_index,
+            const_name_index,
+        } => {
+            write_u1(out, b'e');
+            write_u2(out, *type_name_index);
+            write_u2(out, *const_name_index);
+        }
+        ElementValue::ClassInfoIndex { class_info_index } => {
+            write_u1(out, b'c');
+            write_u2(out, *class_info_index);
+        }
+        ElementValue::AnnotationValue(a) => {
+            write_u1(out, b'@');
+            write_annotation(out, a);
+        }
+        ElementValue::ArrayValue(items) => {
+            write_u1(out, b'[');
+            write_u2(out, items.len() as u16);
+            for item in items {
+                write_element_value(out, item);
+            }
+        }
+    }
+}
+
+fn write_type_annotation(out: &mut Vec<u8>, ta: &TypeAnnotation) {
+    // u1 target_type
+    write_u1(out, ta.target_type);
+
+    // target_info (shape depends on target_type already stored in enum)
+    write_type_annotation_target_info(out, &ta.target_info);
+
+    // type_path
+    write_type_path(out, &ta.target_path);
+
+    // annotation
+    write_annotation(out, &ta.annotation);
+}
+
+fn write_type_annotation_target_info(out: &mut Vec<u8>, info: &TypeAnnotationTargetInfo) {
+    match info {
+        TypeAnnotationTargetInfo::TypeParameter {
+            type_parameter_index,
+        } => {
+            write_u1(out, *type_parameter_index);
+        }
+        TypeAnnotationTargetInfo::Supertype { supertype_index } => {
+            write_u2(out, *supertype_index);
+        }
+        TypeAnnotationTargetInfo::TypeParameterBound {
+            type_parameter_index,
+            bound_index,
+        } => {
+            write_u1(out, *type_parameter_index);
+            write_u1(out, *bound_index);
+        }
+        TypeAnnotationTargetInfo::Empty => {
+            // no bytes
+        }
+        TypeAnnotationTargetInfo::FormalParameter {
+            formal_parameter_index,
+        } => {
+            write_u1(out, *formal_parameter_index);
+        }
+        TypeAnnotationTargetInfo::Throws { throws_type_index } => {
+            write_u2(out, *throws_type_index);
+        }
+        TypeAnnotationTargetInfo::LocalVar { table } => {
+            write_u2(out, table.len() as u16);
+            for e in table {
+                write_u2(out, e.start_pc);
+                write_u2(out, e.length);
+                write_u2(out, e.index);
+            }
+        }
+        TypeAnnotationTargetInfo::Catch {
+            exception_table_index,
+        } => {
+            write_u2(out, *exception_table_index);
+        }
+        TypeAnnotationTargetInfo::Offset { offset } => {
+            write_u2(out, *offset);
+        }
+        TypeAnnotationTargetInfo::TypeArgument {
+            offset,
+            type_argument_index,
+        } => {
+            write_u2(out, *offset);
+            write_u1(out, *type_argument_index);
+        }
+    }
+}
+
+fn write_type_path(out: &mut Vec<u8>, path: &TypePath) {
+    write_u1(out, path.path.len() as u8);
+    for e in &path.path {
+        write_u1(out, e.type_path_kind);
+        write_u1(out, e.type_argument_index);
+    }
 }
 
 fn write_attribute_with_info(out: &mut Vec<u8>, name_index: u16, info: &[u8]) {
@@ -1930,6 +2106,24 @@ fn collect_attribute_names(attributes: &[AttributeInfo], names: &mut Vec<String>
             AttributeInfo::EnclosingMethod { .. } => names.push("EnclosingMethod".to_string()),
             AttributeInfo::BootstrapMethods { .. } => names.push("BootstrapMethods".to_string()),
             AttributeInfo::MethodParameters { .. } => names.push("MethodParameters".to_string()),
+            AttributeInfo::RuntimeVisibleAnnotations { .. } => {
+                names.push("RuntimeVisibleAnnotations".to_string())
+            }
+            AttributeInfo::RuntimeInvisibleAnnotations { .. } => {
+                names.push("RuntimeInvisibleAnnotations".to_string())
+            }
+            AttributeInfo::RuntimeVisibleParameterAnnotations { .. } => {
+                names.push("RuntimeVisibleParameterAnnotations".to_string())
+            }
+            AttributeInfo::RuntimeInvisibleParameterAnnotations { .. } => {
+                names.push("RuntimeInvisibleParameterAnnotations".to_string())
+            }
+            AttributeInfo::RuntimeVisibleTypeAnnotations { .. } => {
+                names.push("RuntimeVisibleTypeAnnotations".to_string())
+            }
+            AttributeInfo::RuntimeInvisibleTypeAnnotations { .. } => {
+                names.push("RuntimeInvisibleTypeAnnotations".to_string())
+            }
             AttributeInfo::Unknown { name, .. } => names.push(name.clone()),
         }
     }
@@ -4156,8 +4350,6 @@ fn read_i4(code: &[u8], pos: &mut usize) -> Result<i32, ClassWriteError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::class_reader::ClassReader;
-    use crate::insn::InvokeDynamicInsnNode;
     use crate::opcodes;
 
     #[test]

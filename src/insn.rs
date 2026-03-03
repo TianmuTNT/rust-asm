@@ -1,6 +1,6 @@
 use crate::opcodes;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::types::Type;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Debug, Clone)]
 pub struct InsnNode {

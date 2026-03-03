@@ -1,3 +1,4 @@
+use crate::constant_pool::CpInfo;
 use crate::error::ClassReadError;
 use crate::insn::{
     AbstractInsnNode, FieldInsnNode, IincInsnNode, Insn, InsnList, InsnNode, IntInsnNode,
@@ -5,9 +6,8 @@ use crate::insn::{
     LookupSwitchInsnNode, MemberRef, MethodInsnNode, MultiANewArrayInsnNode, TableSwitchInsnNode,
     TryCatchBlockNode, TypeInsnNode, VarInsnNode,
 };
-use crate::{constants, opcodes};
-use crate::constant_pool::CpInfo;
 use crate::types::Type;
+use crate::{constants, opcodes};
 
 /// Represents a constant value loadable by the `LDC` (Load Constant) instruction.
 ///
@@ -489,7 +489,107 @@ pub enum AttributeInfo {
     EnclosingMethod { class_index: u16, method_index: u16 },
     BootstrapMethods { methods: Vec<BootstrapMethod> },
     MethodParameters { parameters: Vec<MethodParameter> },
+    RuntimeVisibleAnnotations { annotations: Vec<Annotation> },
+    RuntimeInvisibleAnnotations { annotations: Vec<Annotation> },
+    RuntimeVisibleParameterAnnotations { parameters: ParameterAnnotations },
+    RuntimeInvisibleParameterAnnotations { parameters: ParameterAnnotations },
+    RuntimeVisibleTypeAnnotations { annotations: Vec<TypeAnnotation> },
+    RuntimeInvisibleTypeAnnotations { annotations: Vec<TypeAnnotation> },
     Unknown { name: String, info: Vec<u8> },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Annotation {
+    pub type_descriptor_index: u16,
+    pub element_value_pairs: Vec<ElementValuePair>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ElementValuePair {
+    pub element_name_index: u16,
+    pub value: ElementValue,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ElementValue {
+    ConstValueIndex {
+        tag: u8,
+        const_value_index: u16,
+    },
+    EnumConstValue {
+        type_name_index: u16,
+        const_name_index: u16,
+    },
+    ClassInfoIndex {
+        class_info_index: u16,
+    },
+    AnnotationValue(Box<Annotation>),
+    ArrayValue(Vec<ElementValue>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParameterAnnotations {
+    pub parameters: Vec<Vec<Annotation>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeAnnotation {
+    pub target_type: u8,
+    pub target_info: TypeAnnotationTargetInfo,
+    pub target_path: TypePath,
+    pub annotation: Annotation,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypePath {
+    pub path: Vec<TypePathEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypePathEntry {
+    pub type_path_kind: u8,
+    pub type_argument_index: u8,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TypeAnnotationTargetInfo {
+    TypeParameter {
+        type_parameter_index: u8,
+    },
+    Supertype {
+        supertype_index: u16,
+    },
+    TypeParameterBound {
+        type_parameter_index: u8,
+        bound_index: u8,
+    },
+    Empty,
+    FormalParameter {
+        formal_parameter_index: u8,
+    },
+    Throws {
+        throws_type_index: u16,
+    },
+    LocalVar {
+        table: Vec<LocalVarTargetTableEntry>,
+    },
+    Catch {
+        exception_table_index: u16,
+    },
+    Offset {
+        offset: u16,
+    },
+    TypeArgument {
+        offset: u16,
+        type_argument_index: u8,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LocalVarTargetTableEntry {
+    pub start_pc: u16,
+    pub length: u16,
+    pub index: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -974,6 +1074,30 @@ fn parse_attribute(
             }
             AttributeInfo::MethodParameters { parameters }
         }
+        "RuntimeVisibleAnnotations" => {
+            let annotations = parse_annotations(&mut reader)?;
+            AttributeInfo::RuntimeVisibleAnnotations { annotations }
+        }
+        "RuntimeInvisibleAnnotations" => {
+            let annotations = parse_annotations(&mut reader)?;
+            AttributeInfo::RuntimeInvisibleAnnotations { annotations }
+        }
+        "RuntimeVisibleParameterAnnotations" => {
+            let parameters = parse_parameter_annotations(&mut reader)?;
+            AttributeInfo::RuntimeVisibleParameterAnnotations { parameters }
+        }
+        "RuntimeInvisibleParameterAnnotations" => {
+            let parameters = parse_parameter_annotations(&mut reader)?;
+            AttributeInfo::RuntimeInvisibleParameterAnnotations { parameters }
+        }
+        "RuntimeVisibleTypeAnnotations" => {
+            let annotations = parse_type_annotations(&mut reader)?;
+            AttributeInfo::RuntimeVisibleTypeAnnotations { annotations }
+        }
+        "RuntimeInvisibleTypeAnnotations" => {
+            let annotations = parse_type_annotations(&mut reader)?;
+            AttributeInfo::RuntimeInvisibleTypeAnnotations { annotations }
+        }
         _ => {
             return Ok(AttributeInfo::Unknown {
                 name: name.to_string(),
@@ -987,6 +1111,197 @@ fn parse_attribute(
     }
 
     Ok(attribute)
+}
+
+fn parse_annotations(reader: &mut ByteReader) -> Result<Vec<Annotation>, ClassReadError> {
+    let num = reader.read_u2()? as usize;
+    let mut out = Vec::with_capacity(num);
+    for _ in 0..num {
+        out.push(parse_annotation(reader)?);
+    }
+    Ok(out)
+}
+
+fn parse_annotation(reader: &mut ByteReader) -> Result<Annotation, ClassReadError> {
+    let type_descriptor_index = reader.read_u2()?;
+    let num_pairs = reader.read_u2()? as usize;
+    let mut element_value_pairs = Vec::with_capacity(num_pairs);
+    for _ in 0..num_pairs {
+        let element_name_index = reader.read_u2()?;
+        let value = parse_element_value(reader)?;
+        element_value_pairs.push(ElementValuePair {
+            element_name_index,
+            value,
+        });
+    }
+    Ok(Annotation {
+        type_descriptor_index,
+        element_value_pairs,
+    })
+}
+
+fn parse_parameter_annotations(
+    reader: &mut ByteReader,
+) -> Result<ParameterAnnotations, ClassReadError> {
+    let num_params = reader.read_u1()? as usize;
+    let mut parameters = Vec::with_capacity(num_params);
+    for _ in 0..num_params {
+        let num_ann = reader.read_u2()? as usize;
+        let mut anns = Vec::with_capacity(num_ann);
+        for _ in 0..num_ann {
+            anns.push(parse_annotation(reader)?);
+        }
+        parameters.push(anns);
+    }
+    Ok(ParameterAnnotations { parameters })
+}
+
+fn parse_type_annotations(reader: &mut ByteReader) -> Result<Vec<TypeAnnotation>, ClassReadError> {
+    let num = reader.read_u2()? as usize;
+    let mut out = Vec::with_capacity(num);
+    for _ in 0..num {
+        out.push(parse_type_annotation(reader)?);
+    }
+    Ok(out)
+}
+
+fn parse_type_annotation(reader: &mut ByteReader) -> Result<TypeAnnotation, ClassReadError> {
+    let target_type = reader.read_u1()?;
+    let target_info = parse_type_annotation_target_info(reader, target_type)?;
+    let target_path = parse_type_path(reader)?;
+    let annotation = parse_annotation(reader)?;
+    Ok(TypeAnnotation {
+        target_type,
+        target_info,
+        target_path,
+        annotation,
+    })
+}
+
+fn parse_type_path(reader: &mut ByteReader) -> Result<TypePath, ClassReadError> {
+    let path_length = reader.read_u1()? as usize;
+    let mut path = Vec::with_capacity(path_length);
+    for _ in 0..path_length {
+        path.push(TypePathEntry {
+            type_path_kind: reader.read_u1()?,
+            type_argument_index: reader.read_u1()?,
+        });
+    }
+    Ok(TypePath { path })
+}
+
+fn parse_type_annotation_target_info(
+    reader: &mut ByteReader,
+    target_type: u8,
+) -> Result<TypeAnnotationTargetInfo, ClassReadError> {
+    use crate::constants::*;
+
+    let ti = match target_type {
+        TA_TARGET_CLASS_TYPE_PARAMETER | TA_TARGET_METHOD_TYPE_PARAMETER => {
+            TypeAnnotationTargetInfo::TypeParameter {
+                type_parameter_index: reader.read_u1()?,
+            }
+        }
+
+        TA_TARGET_CLASS_EXTENDS => TypeAnnotationTargetInfo::Supertype {
+            supertype_index: reader.read_u2()?,
+        },
+
+        TA_TARGET_CLASS_TYPE_PARAMETER_BOUND | TA_TARGET_METHOD_TYPE_PARAMETER_BOUND => {
+            TypeAnnotationTargetInfo::TypeParameterBound {
+                type_parameter_index: reader.read_u1()?,
+                bound_index: reader.read_u1()?,
+            }
+        }
+
+        TA_TARGET_FIELD | TA_TARGET_METHOD_RETURN | TA_TARGET_METHOD_RECEIVER => {
+            TypeAnnotationTargetInfo::Empty
+        }
+
+        TA_TARGET_METHOD_FORMAL_PARAMETER => TypeAnnotationTargetInfo::FormalParameter {
+            formal_parameter_index: reader.read_u1()?,
+        },
+
+        TA_TARGET_THROWS => TypeAnnotationTargetInfo::Throws {
+            throws_type_index: reader.read_u2()?,
+        },
+
+        TA_TARGET_LOCAL_VARIABLE | TA_TARGET_RESOURCE_VARIABLE => {
+            let table_length = reader.read_u2()? as usize;
+            let mut table = Vec::with_capacity(table_length);
+            for _ in 0..table_length {
+                table.push(LocalVarTargetTableEntry {
+                    start_pc: reader.read_u2()?,
+                    length: reader.read_u2()?,
+                    index: reader.read_u2()?,
+                });
+            }
+            TypeAnnotationTargetInfo::LocalVar { table }
+        }
+
+        TA_TARGET_EXCEPTION_PARAMETER => TypeAnnotationTargetInfo::Catch {
+            exception_table_index: reader.read_u2()?,
+        },
+
+        TA_TARGET_INSTANCEOF
+        | TA_TARGET_NEW
+        | TA_TARGET_CONSTRUCTOR_REFERENCE_RECEIVER
+        | TA_TARGET_METHOD_REFERENCE_RECEIVER => TypeAnnotationTargetInfo::Offset {
+            offset: reader.read_u2()?,
+        },
+
+        TA_TARGET_CAST
+        | TA_TARGET_CONSTRUCTOR_INVOCATION_TYPE_ARGUMENT
+        | TA_TARGET_METHOD_INVOCATION_TYPE_ARGUMENT
+        | TA_TARGET_CONSTRUCTOR_REFERENCE_TYPE_ARGUMENT
+        | TA_TARGET_METHOD_REFERENCE_TYPE_ARGUMENT => TypeAnnotationTargetInfo::TypeArgument {
+            offset: reader.read_u2()?,
+            type_argument_index: reader.read_u1()?,
+        },
+
+        _ => {
+            return Err(ClassReadError::InvalidAttribute(format!(
+                "TypeAnnotationTargetInfo(target_type=0x{:02X})",
+                target_type
+            )));
+        }
+    };
+
+    Ok(ti)
+}
+
+fn parse_element_value(reader: &mut ByteReader) -> Result<ElementValue, ClassReadError> {
+    let tag = reader.read_u1()?;
+    let v = match tag {
+        b'B' | b'C' | b'D' | b'F' | b'I' | b'J' | b'S' | b'Z' | b's' => {
+            ElementValue::ConstValueIndex {
+                tag,
+                const_value_index: reader.read_u2()?,
+            }
+        }
+        b'e' => ElementValue::EnumConstValue {
+            type_name_index: reader.read_u2()?,
+            const_name_index: reader.read_u2()?,
+        },
+        b'c' => ElementValue::ClassInfoIndex {
+            class_info_index: reader.read_u2()?,
+        },
+        b'@' => ElementValue::AnnotationValue(Box::new(parse_annotation(reader)?)),
+        b'[' => {
+            let n = reader.read_u2()? as usize;
+            let mut items = Vec::with_capacity(n);
+            for _ in 0..n {
+                items.push(parse_element_value(reader)?);
+            }
+            ElementValue::ArrayValue(items)
+        }
+        _ => {
+            return Err(ClassReadError::InvalidAttribute(
+                "AnnotationElementValue".to_string(),
+            ));
+        }
+    };
+    Ok(v)
 }
 
 fn parse_verification_type(
@@ -1641,7 +1956,7 @@ fn visit_instruction(
                             mv.visit_ldc_insn(LdcConstant::Class(value.get_descriptor()));
                         }
                     }
-                  
+
                     return Ok(());
                 }
                 LdcValue::Int(value) => {
@@ -1769,6 +2084,8 @@ impl<'a> ByteReader<'a> {
 
 #[cfg(test)]
 mod tests {
+    use crate::constants::*;
+
     use super::*;
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -1905,5 +2222,176 @@ mod tests {
         // 1 -> align 4 -> skips 3 bytes -> pos 4
         assert!(reader.align4(0).is_ok());
         assert_eq!(reader.pos(), 4);
+    }
+
+    #[test]
+    fn test_parse_runtime_visible_type_annotations_supertype() {
+        // RuntimeVisibleTypeAnnotations:
+        // u2 num_annotations = 1
+        // type_annotation:
+        //   u1 target_type = TA_TARGET_CLASS_EXTENDS
+        //   u2 supertype_index = 5
+        //   type_path: u1 path_len=0
+        //   annotation:
+        //     u2 type_descriptor_index=10
+        //     u2 num_pairs=0
+        let mut info = vec![];
+        u2(1, &mut info);
+        u1(TA_TARGET_CLASS_EXTENDS, &mut info);
+        u2(5, &mut info);
+        u1(0, &mut info);
+        u2(10, &mut info);
+        u2(0, &mut info);
+
+        let cp: Vec<CpInfo> = vec![];
+        let attr = parse_attribute("RuntimeVisibleTypeAnnotations", info, &cp).unwrap();
+
+        match attr {
+            AttributeInfo::RuntimeVisibleTypeAnnotations { annotations } => {
+                assert_eq!(annotations.len(), 1);
+                let a = &annotations[0];
+                assert_eq!(a.target_type, TA_TARGET_CLASS_EXTENDS);
+                assert!(matches!(
+                    a.target_info,
+                    TypeAnnotationTargetInfo::Supertype { supertype_index: 5 }
+                ));
+                assert_eq!(a.target_path.path.len(), 0);
+                assert_eq!(a.annotation.type_descriptor_index, 10);
+                assert_eq!(a.annotation.element_value_pairs.len(), 0);
+            }
+            other => panic!("unexpected attr: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_runtime_visible_type_annotations_formal_parameter_with_path() {
+        // target_type = TA_TARGET_METHOD_FORMAL_PARAMETER
+        // u1 formal_parameter_index = 2
+        // type_path len=1 entry(kind=TA_TYPE_PATH_ARRAY, arg_index=0)
+        // annotation: type_index=9, num_pairs=0
+        let mut info = vec![];
+        u2(1, &mut info);
+        u1(TA_TARGET_METHOD_FORMAL_PARAMETER, &mut info);
+        u1(2, &mut info);
+
+        u1(1, &mut info); // path_length
+        u1(TA_TYPE_PATH_ARRAY, &mut info);
+        u1(0, &mut info);
+
+        u2(9, &mut info);
+        u2(0, &mut info);
+
+        let cp: Vec<CpInfo> = vec![];
+        let attr = parse_attribute("RuntimeVisibleTypeAnnotations", info, &cp).unwrap();
+
+        match attr {
+            AttributeInfo::RuntimeVisibleTypeAnnotations { annotations } => {
+                let a = &annotations[0];
+                assert_eq!(a.target_type, TA_TARGET_METHOD_FORMAL_PARAMETER);
+                assert!(matches!(
+                    a.target_info,
+                    TypeAnnotationTargetInfo::FormalParameter {
+                        formal_parameter_index: 2
+                    }
+                ));
+                assert_eq!(a.target_path.path.len(), 1);
+                assert_eq!(a.target_path.path[0].type_path_kind, TA_TYPE_PATH_ARRAY);
+                assert_eq!(a.target_path.path[0].type_argument_index, 0);
+            }
+            other => panic!("unexpected attr: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_runtime_visible_type_annotations_localvar_table() {
+        // target_type = TA_TARGET_LOCAL_VARIABLE
+        // u2 table_length = 1
+        // entry: start_pc=1 length=2 index=3
+        // type_path len=0
+        // annotation: type_index=8, num_pairs=0
+        let mut info = vec![];
+        u2(1, &mut info);
+        u1(TA_TARGET_LOCAL_VARIABLE, &mut info);
+
+        u2(1, &mut info); // table_length
+        u2(1, &mut info);
+        u2(2, &mut info);
+        u2(3, &mut info);
+
+        u1(0, &mut info); // path_length
+        u2(8, &mut info);
+        u2(0, &mut info);
+
+        let cp: Vec<CpInfo> = vec![];
+        let attr = parse_attribute("RuntimeVisibleTypeAnnotations", info, &cp).unwrap();
+
+        match attr {
+            AttributeInfo::RuntimeVisibleTypeAnnotations { annotations } => {
+                let a = &annotations[0];
+                assert_eq!(a.target_type, TA_TARGET_LOCAL_VARIABLE);
+                match &a.target_info {
+                    TypeAnnotationTargetInfo::LocalVar { table } => {
+                        assert_eq!(table.len(), 1);
+                        assert_eq!(table[0].start_pc, 1);
+                        assert_eq!(table[0].length, 2);
+                        assert_eq!(table[0].index, 3);
+                    }
+                    other => panic!("unexpected target_info: {:?}", other),
+                }
+            }
+            other => panic!("unexpected attr: {:?}", other),
+        }
+    }
+
+    fn u1(v: u8, out: &mut Vec<u8>) {
+        out.push(v);
+    }
+    fn u2(v: u16, out: &mut Vec<u8>) {
+        out.extend_from_slice(&v.to_be_bytes());
+    }
+
+    #[test]
+    fn test_parse_runtime_visible_annotations_one_empty() {
+        // u2 num_annotations=1
+        // annotation: type=10, pairs=0
+        let mut info = vec![];
+        u2(1, &mut info);
+        u2(10, &mut info);
+        u2(0, &mut info);
+
+        let cp: Vec<CpInfo> = vec![];
+        let attr = parse_attribute("RuntimeVisibleAnnotations", info, &cp).unwrap();
+        match attr {
+            AttributeInfo::RuntimeVisibleAnnotations { annotations } => {
+                assert_eq!(annotations.len(), 1);
+                assert_eq!(annotations[0].type_descriptor_index, 10);
+                assert_eq!(annotations[0].element_value_pairs.len(), 0);
+            }
+            other => panic!("unexpected attr: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_runtime_visible_parameter_annotations_two_params() {
+        // u1 num_params=2
+        // p0: u2 num_ann=1, annotation(type=10,pairs=0)
+        // p1: u2 num_ann=0
+        let mut info = vec![];
+        u1(2, &mut info);
+        u2(1, &mut info);
+        u2(10, &mut info);
+        u2(0, &mut info);
+        u2(0, &mut info);
+
+        let cp: Vec<CpInfo> = vec![];
+        let attr = parse_attribute("RuntimeVisibleParameterAnnotations", info, &cp).unwrap();
+        match attr {
+            AttributeInfo::RuntimeVisibleParameterAnnotations { parameters } => {
+                assert_eq!(parameters.parameters.len(), 2);
+                assert_eq!(parameters.parameters[0].len(), 1);
+                assert_eq!(parameters.parameters[1].len(), 0);
+            }
+            other => panic!("unexpected attr: {:?}", other),
+        }
     }
 }
