@@ -10,7 +10,7 @@ use crate::constants;
 use crate::error::ClassWriteError;
 use crate::insn::{
     AbstractInsnNode, BootstrapArgument, FieldInsnNode, Handle, Insn, InsnList, InsnNode,
-    InvokeInterfaceInsnNode, JumpInsnNode, JumpLabelInsnNode, Label, LabelNode, LdcInsnNode,
+    IincInsnNode, InvokeInterfaceInsnNode, JumpInsnNode, JumpLabelInsnNode, Label, LabelNode, LdcInsnNode,
     LdcValue, LineNumberInsnNode, LookupSwitchInsnNode, LookupSwitchLabelInsnNode, MemberRef,
     MethodInsnNode, NodeList, TableSwitchInsnNode, TableSwitchLabelInsnNode, TryCatchBlockNode,
     TypeInsnNode, VarInsnNode,
@@ -736,6 +736,15 @@ impl MethodVisitor {
     /// Visits a constant instruction (LDC).
     pub fn visit_ldc_insn(&mut self, value: LdcInsnNode) -> &mut Self {
         self.insns.add(Insn::Ldc(value));
+        self
+    }
+
+    pub fn visit_iinc_insn(&mut self, var_index: u16, increment: i16) -> &mut Self {
+        self.insns.add(Insn::Iinc(IincInsnNode {
+            insn: opcodes::IINC.into(),
+            var_index,
+            increment,
+        }));
         self
     }
 
