@@ -2559,6 +2559,75 @@ mod tests {
     }
 
     #[test]
+    fn test_method_node_contains_try_catch_blocks() {
+        let mut writer = ClassWriter::new(0);
+        writer.visit(
+            52,
+            0,
+            ACC_PUBLIC,
+            "TestTryCatchNode",
+            Some("java/lang/Object"),
+            &[],
+        );
+
+        let mut ctor = writer.visit_method(ACC_PUBLIC, "<init>", "()V");
+        ctor.visit_code();
+        ctor.visit_var_insn(opcodes::ALOAD, 0);
+        ctor.visit_method_insn(
+            opcodes::INVOKESPECIAL,
+            "java/lang/Object",
+            "<init>",
+            "()V",
+            false,
+        );
+        ctor.visit_insn(opcodes::RETURN);
+        ctor.visit_maxs(1, 1);
+        ctor.visit_end(&mut writer);
+
+        let start = Label::new();
+        let end = Label::new();
+        let handler = Label::new();
+        let mut method =
+            writer.visit_method(ACC_PUBLIC | ACC_STATIC, "safeLen", "(Ljava/lang/String;)I");
+        method.visit_code();
+        method.visit_label(start);
+        method.visit_var_insn(opcodes::ALOAD, 0);
+        method.visit_method_insn(
+            opcodes::INVOKEVIRTUAL,
+            "java/lang/String",
+            "length",
+            "()I",
+            false,
+        );
+        method.visit_insn(opcodes::IRETURN);
+        method.visit_label(end);
+        method.visit_label(handler);
+        method.visit_var_insn(opcodes::ASTORE, 1);
+        method.visit_insn(opcodes::ICONST_M1);
+        method.visit_insn(opcodes::IRETURN);
+        method.visit_try_catch_block(start, end, handler, Some("java/lang/RuntimeException"));
+        method.visit_maxs(1, 2);
+        method.visit_end(&mut writer);
+
+        let bytes = writer.to_bytes().expect("class should encode");
+        let class = ClassReader::new(&bytes)
+            .to_class_node()
+            .expect("class should decode");
+        let method = class
+            .methods
+            .iter()
+            .find(|method| method.name == "safeLen")
+            .expect("method should exist");
+
+        assert_eq!(method.exception_table.len(), 1);
+        assert_eq!(method.try_catch_blocks.len(), 1);
+        assert_eq!(
+            method.try_catch_blocks[0].catch_type.as_deref(),
+            Some("java/lang/RuntimeException")
+        );
+    }
+
+    #[test]
     fn test_parse_runtime_visible_annotations_one_empty() {
         // u2 num_annotations=1
         // annotation: type=10, pairs=0

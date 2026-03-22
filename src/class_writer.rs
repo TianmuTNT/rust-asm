@@ -59,6 +59,14 @@ struct MethodData {
     attributes: Vec<AttributeInfo>,
 }
 
+#[derive(Debug, Clone)]
+struct PendingTryCatchBlock {
+    start: LabelNode,
+    end: LabelNode,
+    handler: LabelNode,
+    catch_type: Option<String>,
+}
+
 /// A writer that generates a Java Class File structure.
 ///
 /// This is the main entry point for creating class files programmatically.
@@ -542,6 +550,7 @@ pub struct MethodVisitor {
     insns: NodeList,
     pending_type_names: Vec<String>,
     exception_table: Vec<ExceptionTableEntry>,
+    pending_try_catch_blocks: Vec<PendingTryCatchBlock>,
     code_attributes: Vec<AttributeInfo>,
     attributes: Vec<AttributeInfo>,
 }
@@ -558,6 +567,7 @@ impl MethodVisitor {
             insns: NodeList::new(),
             pending_type_names: Vec::new(),
             exception_table: Vec::new(),
+            pending_try_catch_blocks: Vec::new(),
             code_attributes: Vec::new(),
             attributes: Vec::new(),
         }
@@ -702,6 +712,22 @@ impl MethodVisitor {
         self
     }
 
+    pub fn visit_try_catch_block(
+        &mut self,
+        start: Label,
+        end: Label,
+        handler: Label,
+        catch_type: Option<&str>,
+    ) -> &mut Self {
+        self.pending_try_catch_blocks.push(PendingTryCatchBlock {
+            start: LabelNode::from_label(start),
+            end: LabelNode::from_label(end),
+            handler: LabelNode::from_label(handler),
+            catch_type: catch_type.map(str::to_string),
+        });
+        self
+    }
+
     pub fn visit_line_number(&mut self, line: u16, start: LabelNode) -> &mut Self {
         self.insns.add(LineNumberInsnNode::new(line, start));
         self
@@ -764,6 +790,7 @@ impl MethodVisitor {
                 self.insns,
                 &mut class.cp,
                 std::mem::take(&mut self.exception_table),
+                std::mem::take(&mut self.pending_try_catch_blocks),
                 std::mem::take(&mut self.code_attributes),
             ))
         } else {
@@ -946,6 +973,7 @@ pub struct CodeBody {
     max_locals: u16,
     insns: NodeList,
     exception_table: Vec<ExceptionTableEntry>,
+    pending_try_catch_blocks: Vec<PendingTryCatchBlock>,
     attributes: Vec<AttributeInfo>,
 }
 
@@ -956,6 +984,7 @@ impl CodeBody {
             max_locals,
             insns,
             exception_table: Vec::new(),
+            pending_try_catch_blocks: Vec::new(),
             attributes: Vec::new(),
         }
     }
@@ -1139,6 +1168,36 @@ impl CodeBody {
             }
         }
         let mut attributes = self.attributes;
+        let mut exception_table = self.exception_table;
+        let mut try_catch_blocks = Vec::new();
+        for pending in self.pending_try_catch_blocks {
+            let Some(start_pc) = label_offsets.get(&pending.start.id).copied() else {
+                continue;
+            };
+            let Some(end_pc) = label_offsets.get(&pending.end.id).copied() else {
+                continue;
+            };
+            let Some(handler_pc) = label_offsets.get(&pending.handler.id).copied() else {
+                continue;
+            };
+            let catch_type = pending
+                .catch_type
+                .as_deref()
+                .map(|name| cp.class(name))
+                .unwrap_or(0);
+            exception_table.push(ExceptionTableEntry {
+                start_pc,
+                end_pc,
+                handler_pc,
+                catch_type,
+            });
+            try_catch_blocks.push(TryCatchBlockNode {
+                start: pending.start,
+                end: pending.end,
+                handler: pending.handler,
+                catch_type: pending.catch_type,
+            });
+        }
         if !pending_lines.is_empty() {
             let mut entries = Vec::new();
             for line in pending_lines {
@@ -1159,8 +1218,8 @@ impl CodeBody {
             code,
             instructions,
             insn_nodes,
-            exception_table: self.exception_table,
-            try_catch_blocks: Vec::new(),
+            exception_table,
+            try_catch_blocks,
             attributes,
         }
     }
@@ -1213,6 +1272,7 @@ fn build_code_attribute(
     insns: NodeList,
     cp: &mut ConstantPoolBuilder,
     exception_table: Vec<ExceptionTableEntry>,
+    pending_try_catch_blocks: Vec<PendingTryCatchBlock>,
     attributes: Vec<AttributeInfo>,
 ) -> CodeAttribute {
     CodeBody {
@@ -1220,6 +1280,7 @@ fn build_code_attribute(
         max_locals,
         insns,
         exception_table,
+        pending_try_catch_blocks,
         attributes,
     }
     .build(cp)
