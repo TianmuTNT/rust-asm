@@ -11,7 +11,8 @@ use crate::error::ClassWriteError;
 use crate::insn::{
     AbstractInsnNode, BootstrapArgument, FieldInsnNode, Handle, Insn, InsnList, InsnNode,
     InvokeInterfaceInsnNode, JumpInsnNode, JumpLabelInsnNode, Label, LabelNode, LdcInsnNode,
-    LdcValue, LineNumberInsnNode, MemberRef, MethodInsnNode, NodeList, TryCatchBlockNode,
+    LdcValue, LineNumberInsnNode, LookupSwitchInsnNode, LookupSwitchLabelInsnNode, MemberRef,
+    MethodInsnNode, NodeList, TableSwitchInsnNode, TableSwitchLabelInsnNode, TryCatchBlockNode,
     TypeInsnNode, VarInsnNode,
 };
 use crate::nodes::{ClassNode, FieldNode, InnerClassNode, MethodNode};
@@ -658,6 +659,44 @@ impl MethodVisitor {
         self
     }
 
+    pub fn visit_table_switch(
+        &mut self,
+        default: Label,
+        low: i32,
+        high: i32,
+        targets: &[Label],
+    ) -> &mut Self {
+        assert_eq!(
+            targets.len(),
+            if high < low {
+                0
+            } else {
+                (high - low + 1) as usize
+            },
+            "tableswitch target count must match low..=high range"
+        );
+        self.insns.add(TableSwitchLabelInsnNode {
+            insn: opcodes::TABLESWITCH.into(),
+            default_target: LabelNode::from_label(default),
+            low,
+            high,
+            targets: targets.iter().copied().map(LabelNode::from_label).collect(),
+        });
+        self
+    }
+
+    pub fn visit_lookup_switch(&mut self, default: Label, pairs: &[(i32, Label)]) -> &mut Self {
+        self.insns.add(LookupSwitchLabelInsnNode {
+            insn: opcodes::LOOKUPSWITCH.into(),
+            default_target: LabelNode::from_label(default),
+            pairs: pairs
+                .iter()
+                .map(|(key, label)| (*key, LabelNode::from_label(*label)))
+                .collect(),
+        });
+        self
+    }
+
     pub fn visit_label(&mut self, label: Label) -> &mut Self {
         self.insns.add(LabelNode::from_label(label));
         self
@@ -928,6 +967,8 @@ impl CodeBody {
         let mut label_offsets: HashMap<usize, u16> = HashMap::new();
         let mut pending_lines: Vec<LineNumberInsnNode> = Vec::new();
         let mut jump_fixups: Vec<JumpFixup> = Vec::new();
+        let mut table_switch_fixups: Vec<TableSwitchFixup> = Vec::new();
+        let mut lookup_switch_fixups: Vec<LookupSwitchFixup> = Vec::new();
         for node in self.insns.into_nodes() {
             match node {
                 AbstractInsnNode::Insn(insn) => {
@@ -969,6 +1010,70 @@ impl CodeBody {
                     pending_lines.push(line);
                     insn_nodes.push(AbstractInsnNode::LineNumber(line));
                 }
+                AbstractInsnNode::TableSwitchLabel(node) => {
+                    let start = code.len();
+                    code.push(node.insn.opcode);
+                    write_switch_padding(&mut code, start);
+                    let default_pos = code.len();
+                    write_i4(&mut code, 0);
+                    write_i4(&mut code, node.low);
+                    write_i4(&mut code, node.high);
+                    let mut target_positions = Vec::with_capacity(node.targets.len());
+                    for _ in &node.targets {
+                        target_positions.push(code.len());
+                        write_i4(&mut code, 0);
+                    }
+                    let insn = Insn::TableSwitch(TableSwitchInsnNode {
+                        insn: node.insn,
+                        default_offset: 0,
+                        low: node.low,
+                        high: node.high,
+                        offsets: vec![0; node.targets.len()],
+                    });
+                    instructions.push(insn.clone());
+                    insn_nodes.push(AbstractInsnNode::Insn(insn));
+                    table_switch_fixups.push(TableSwitchFixup {
+                        start,
+                        default_target: node.default_target,
+                        default_position: default_pos,
+                        targets: node.targets,
+                        target_positions,
+                        low: node.low,
+                        high: node.high,
+                        insn_index: instructions.len() - 1,
+                        node_index: insn_nodes.len() - 1,
+                    });
+                }
+                AbstractInsnNode::LookupSwitchLabel(node) => {
+                    let start = code.len();
+                    code.push(node.insn.opcode);
+                    write_switch_padding(&mut code, start);
+                    let default_pos = code.len();
+                    write_i4(&mut code, 0);
+                    write_i4(&mut code, node.pairs.len() as i32);
+                    let mut pair_positions = Vec::with_capacity(node.pairs.len());
+                    for (key, _) in &node.pairs {
+                        write_i4(&mut code, *key);
+                        pair_positions.push(code.len());
+                        write_i4(&mut code, 0);
+                    }
+                    let insn = Insn::LookupSwitch(LookupSwitchInsnNode {
+                        insn: node.insn,
+                        default_offset: 0,
+                        pairs: node.pairs.iter().map(|(key, _)| (*key, 0)).collect(),
+                    });
+                    instructions.push(insn.clone());
+                    insn_nodes.push(AbstractInsnNode::Insn(insn));
+                    lookup_switch_fixups.push(LookupSwitchFixup {
+                        start,
+                        default_target: node.default_target,
+                        default_position: default_pos,
+                        pairs: node.pairs,
+                        pair_positions,
+                        insn_index: instructions.len() - 1,
+                        node_index: insn_nodes.len() - 1,
+                    });
+                }
             }
         }
         for fixup in jump_fixups {
@@ -984,6 +1089,50 @@ impl CodeBody {
                         opcode: fixup.opcode,
                     },
                     offset,
+                });
+                instructions[fixup.insn_index] = resolved.clone();
+                insn_nodes[fixup.node_index] = AbstractInsnNode::Insn(resolved);
+            }
+        }
+        for fixup in table_switch_fixups {
+            if let Some(default_offset) = label_offsets.get(&fixup.default_target.id) {
+                let default_delta = *default_offset as i32 - fixup.start as i32;
+                write_i4_at(&mut code, fixup.default_position, default_delta);
+                let mut offsets = Vec::with_capacity(fixup.targets.len());
+                for (index, target) in fixup.targets.iter().enumerate() {
+                    if let Some(target_offset) = label_offsets.get(&target.id) {
+                        let delta = *target_offset as i32 - fixup.start as i32;
+                        write_i4_at(&mut code, fixup.target_positions[index], delta);
+                        offsets.push(delta);
+                    }
+                }
+                let resolved = Insn::TableSwitch(TableSwitchInsnNode {
+                    insn: opcodes::TABLESWITCH.into(),
+                    default_offset: default_delta,
+                    low: fixup.low,
+                    high: fixup.high,
+                    offsets,
+                });
+                instructions[fixup.insn_index] = resolved.clone();
+                insn_nodes[fixup.node_index] = AbstractInsnNode::Insn(resolved);
+            }
+        }
+        for fixup in lookup_switch_fixups {
+            if let Some(default_offset) = label_offsets.get(&fixup.default_target.id) {
+                let default_delta = *default_offset as i32 - fixup.start as i32;
+                write_i4_at(&mut code, fixup.default_position, default_delta);
+                let mut pairs = Vec::with_capacity(fixup.pairs.len());
+                for (index, (key, target)) in fixup.pairs.iter().enumerate() {
+                    if let Some(target_offset) = label_offsets.get(&target.id) {
+                        let delta = *target_offset as i32 - fixup.start as i32;
+                        write_i4_at(&mut code, fixup.pair_positions[index], delta);
+                        pairs.push((*key, delta));
+                    }
+                }
+                let resolved = Insn::LookupSwitch(LookupSwitchInsnNode {
+                    insn: opcodes::LOOKUPSWITCH.into(),
+                    default_offset: default_delta,
+                    pairs,
                 });
                 instructions[fixup.insn_index] = resolved.clone();
                 insn_nodes[fixup.node_index] = AbstractInsnNode::Insn(resolved);
@@ -1022,6 +1171,30 @@ struct JumpFixup {
     start: usize,
     opcode: u8,
     target: LabelNode,
+    insn_index: usize,
+    node_index: usize,
+}
+
+#[derive(Debug, Clone)]
+struct TableSwitchFixup {
+    start: usize,
+    default_target: LabelNode,
+    default_position: usize,
+    targets: Vec<LabelNode>,
+    target_positions: Vec<usize>,
+    low: i32,
+    high: i32,
+    insn_index: usize,
+    node_index: usize,
+}
+
+#[derive(Debug, Clone)]
+struct LookupSwitchFixup {
+    start: usize,
+    default_target: LabelNode,
+    default_position: usize,
+    pairs: Vec<(i32, LabelNode)>,
+    pair_positions: Vec<usize>,
     insn_index: usize,
     node_index: usize,
 }
