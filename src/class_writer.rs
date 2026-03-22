@@ -11,7 +11,8 @@ use crate::error::ClassWriteError;
 use crate::insn::{
     AbstractInsnNode, BootstrapArgument, FieldInsnNode, Handle, Insn, InsnList, InsnNode,
     InvokeInterfaceInsnNode, JumpInsnNode, JumpLabelInsnNode, Label, LabelNode, LdcInsnNode,
-    LdcValue, LineNumberInsnNode, MemberRef, MethodInsnNode, NodeList, TypeInsnNode, VarInsnNode,
+    LdcValue, LineNumberInsnNode, MemberRef, MethodInsnNode, NodeList, TryCatchBlockNode,
+    TypeInsnNode, VarInsnNode,
 };
 use crate::nodes::{ClassNode, FieldNode, InnerClassNode, MethodNode};
 use crate::opcodes;
@@ -44,7 +45,15 @@ struct MethodData {
     max_stack: u16,
     max_locals: u16,
     instructions: InsnList,
+    instruction_offsets: Vec<u16>,
+    insn_nodes: Vec<AbstractInsnNode>,
     exception_table: Vec<ExceptionTableEntry>,
+    try_catch_blocks: Vec<TryCatchBlockNode>,
+    line_numbers: Vec<LineNumber>,
+    local_variables: Vec<LocalVariable>,
+    method_parameters: Vec<MethodParameter>,
+    exceptions: Vec<String>,
+    signature: Option<String>,
     code_attributes: Vec<AttributeInfo>,
     attributes: Vec<AttributeInfo>,
 }
@@ -154,7 +163,15 @@ impl ClassWriter {
                 max_stack: method.max_stack,
                 max_locals: method.max_locals,
                 instructions: method.instructions,
+                instruction_offsets: method.instruction_offsets,
+                insn_nodes: method.insn_nodes,
                 exception_table: method.exception_table,
+                try_catch_blocks: method.try_catch_blocks,
+                line_numbers: method.line_numbers,
+                local_variables: method.local_variables,
+                method_parameters: method.method_parameters,
+                exceptions: method.exceptions,
+                signature: method.signature,
                 code_attributes: method.code_attributes,
                 attributes: method.attributes,
             });
@@ -388,7 +405,15 @@ impl ClassWriter {
                 max_stack: method.max_stack,
                 max_locals: method.max_locals,
                 instructions: method.instructions,
+                instruction_offsets: method.instruction_offsets,
+                insn_nodes: method.insn_nodes,
                 exception_table: method.exception_table,
+                try_catch_blocks: method.try_catch_blocks,
+                line_numbers: method.line_numbers,
+                local_variables: method.local_variables,
+                method_parameters: method.method_parameters,
+                exceptions: method.exceptions,
+                signature: method.signature,
                 code_attributes: method.code_attributes,
                 attributes: method.attributes,
             });
@@ -705,31 +730,85 @@ impl MethodVisitor {
         } else {
             None
         };
-        let (has_code, max_stack, max_locals, instructions, exception_table, code_attributes) =
-            if let Some(code) = code {
-                let CodeAttribute {
-                    max_stack,
-                    max_locals,
-                    instructions,
-                    exception_table,
-                    attributes,
-                    ..
-                } = code;
-                let mut list = InsnList::new();
-                for insn in instructions {
-                    list.add(insn);
-                }
-                (
-                    true,
-                    max_stack,
-                    max_locals,
-                    list,
-                    exception_table,
-                    attributes,
-                )
-            } else {
-                (false, 0, 0, InsnList::new(), Vec::new(), Vec::new())
-            };
+        let (
+            has_code,
+            max_stack,
+            max_locals,
+            instructions,
+            instruction_offsets,
+            insn_nodes,
+            exception_table,
+            try_catch_blocks,
+            line_numbers,
+            local_variables,
+            code_attributes,
+        ) = if let Some(code) = code {
+            let CodeAttribute {
+                max_stack,
+                max_locals,
+                instructions,
+                insn_nodes,
+                exception_table,
+                try_catch_blocks,
+                attributes,
+                ..
+            } = code;
+            let mut list = InsnList::new();
+            for insn in instructions {
+                list.add(insn);
+            }
+            let line_numbers = attributes
+                .iter()
+                .find_map(|attr| match attr {
+                    AttributeInfo::LineNumberTable { entries } => Some(entries.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let local_variables = attributes
+                .iter()
+                .find_map(|attr| match attr {
+                    AttributeInfo::LocalVariableTable { entries } => Some(entries.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            (
+                true,
+                max_stack,
+                max_locals,
+                list,
+                Vec::new(),
+                insn_nodes,
+                exception_table,
+                try_catch_blocks,
+                line_numbers,
+                local_variables,
+                attributes,
+            )
+        } else {
+            (
+                false,
+                0,
+                0,
+                InsnList::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+        };
+        let method_parameters = self
+            .attributes
+            .iter()
+            .find_map(|attr| match attr {
+                AttributeInfo::MethodParameters { parameters } => Some(parameters.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let exceptions = Vec::new();
+        let signature = None;
         class.methods.push(MethodData {
             access_flags: self.access_flags,
             name: self.name,
@@ -738,7 +817,15 @@ impl MethodVisitor {
             max_stack,
             max_locals,
             instructions,
+            instruction_offsets,
+            insn_nodes,
             exception_table,
+            try_catch_blocks,
+            line_numbers,
+            local_variables,
+            method_parameters,
+            exceptions,
+            signature,
             code_attributes,
             attributes: std::mem::take(&mut self.attributes),
         });
@@ -1614,15 +1701,34 @@ fn write_method(
 
 fn method_code_attribute(method: &MethodNode) -> Result<CodeAttribute, ClassWriteError> {
     let (code, instructions) = build_code_from_insn_list(&method.instructions)?;
+    let mut attributes = method.code_attributes.clone();
+    if !method.line_numbers.is_empty()
+        && !attributes
+            .iter()
+            .any(|attr| matches!(attr, AttributeInfo::LineNumberTable { .. }))
+    {
+        attributes.push(AttributeInfo::LineNumberTable {
+            entries: method.line_numbers.clone(),
+        });
+    }
+    if !method.local_variables.is_empty()
+        && !attributes
+            .iter()
+            .any(|attr| matches!(attr, AttributeInfo::LocalVariableTable { .. }))
+    {
+        attributes.push(AttributeInfo::LocalVariableTable {
+            entries: method.local_variables.clone(),
+        });
+    }
     Ok(CodeAttribute {
         max_stack: method.max_stack,
         max_locals: method.max_locals,
         code,
         instructions,
-        insn_nodes: Vec::new(),
+        insn_nodes: method.insn_nodes.clone(),
         exception_table: method.exception_table.clone(),
-        try_catch_blocks: Vec::new(),
-        attributes: method.code_attributes.clone(),
+        try_catch_blocks: method.try_catch_blocks.clone(),
+        attributes,
     })
 }
 
