@@ -8,4 +8,5 @@ pub mod insn;
 pub mod macros;
 pub mod nodes;
 pub mod opcodes;
+pub mod signature;
 pub mod types;
