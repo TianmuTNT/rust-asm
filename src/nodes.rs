@@ -1,6 +1,8 @@
 use crate::class_reader::{AttributeInfo, ExceptionTableEntry};
+use crate::class_reader::{LineNumber, LocalVariable, MethodParameter};
 use crate::constant_pool::CpInfo;
 use crate::insn::InsnList;
+use crate::insn::{AbstractInsnNode, TryCatchBlockNode};
 
 /// Represents a parsed Java Class File.
 ///
@@ -149,8 +151,32 @@ pub struct MethodNode {
     /// Decoded JVM instructions in an `InsnList`.
     pub instructions: InsnList,
 
+    /// Original bytecode offsets corresponding to entries in `instructions`.
+    pub instruction_offsets: Vec<u16>,
+
+    /// Decoded JVM instructions as tree-style nodes, preserving labels and line markers.
+    pub insn_nodes: Vec<AbstractInsnNode>,
+
     /// Exception handlers (raw entries in the code attribute).
     pub exception_table: Vec<ExceptionTableEntry>,
+
+    /// Decoded try/catch blocks keyed by labels in `insn_nodes`.
+    pub try_catch_blocks: Vec<TryCatchBlockNode>,
+
+    /// Decoded line number entries from the `LineNumberTable`.
+    pub line_numbers: Vec<LineNumber>,
+
+    /// Decoded local variable entries from the `LocalVariableTable`.
+    pub local_variables: Vec<LocalVariable>,
+
+    /// Decoded method parameters from the `MethodParameters` attribute.
+    pub method_parameters: Vec<MethodParameter>,
+
+    /// Internal names of declared checked exceptions from the `Exceptions` attribute.
+    pub exceptions: Vec<String>,
+
+    /// Generic signature string from the `Signature` attribute, if present.
+    pub signature: Option<String>,
 
     /// Attributes associated with the `Code` attribute (e.g., `LineNumberTable`, `LocalVariableTable`).
     pub code_attributes: Vec<AttributeInfo>,

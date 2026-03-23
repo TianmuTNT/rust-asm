@@ -102,6 +102,22 @@ pub struct LookupSwitchInsnNode {
 }
 
 #[derive(Debug, Clone)]
+pub struct TableSwitchLabelInsnNode {
+    pub insn: InsnNode,
+    pub default_target: LabelNode,
+    pub low: i32,
+    pub high: i32,
+    pub targets: Vec<LabelNode>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LookupSwitchLabelInsnNode {
+    pub insn: InsnNode,
+    pub default_target: LabelNode,
+    pub pairs: Vec<(i32, LabelNode)>,
+}
+
+#[derive(Debug, Clone)]
 pub struct MultiANewArrayInsnNode {
     pub insn: InsnNode,
     pub type_index: u16,
@@ -181,6 +197,8 @@ pub enum AbstractInsnNode {
     LineNumber(LineNumberInsnNode),
     Insn(Insn),
     JumpLabel(JumpLabelInsnNode),
+    TableSwitchLabel(TableSwitchLabelInsnNode),
+    LookupSwitchLabel(LookupSwitchLabelInsnNode),
 }
 
 #[derive(Debug, Clone)]
@@ -317,6 +335,18 @@ impl From<Insn> for AbstractInsnNode {
 impl From<JumpLabelInsnNode> for AbstractInsnNode {
     fn from(value: JumpLabelInsnNode) -> Self {
         AbstractInsnNode::JumpLabel(value)
+    }
+}
+
+impl From<TableSwitchLabelInsnNode> for AbstractInsnNode {
+    fn from(value: TableSwitchLabelInsnNode) -> Self {
+        AbstractInsnNode::TableSwitchLabel(value)
+    }
+}
+
+impl From<LookupSwitchLabelInsnNode> for AbstractInsnNode {
+    fn from(value: LookupSwitchLabelInsnNode) -> Self {
+        AbstractInsnNode::LookupSwitchLabel(value)
     }
 }
 

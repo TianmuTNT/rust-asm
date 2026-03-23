@@ -3,8 +3,8 @@ use crate::error::ClassReadError;
 use crate::insn::{
     AbstractInsnNode, FieldInsnNode, IincInsnNode, Insn, InsnList, InsnNode, IntInsnNode,
     InvokeDynamicInsnNode, InvokeInterfaceInsnNode, JumpInsnNode, LabelNode, LdcInsnNode, LdcValue,
-    LookupSwitchInsnNode, MemberRef, MethodInsnNode, MultiANewArrayInsnNode, TableSwitchInsnNode,
-    TryCatchBlockNode, TypeInsnNode, VarInsnNode,
+    LineNumberInsnNode, LookupSwitchInsnNode, MemberRef, MethodInsnNode, MultiANewArrayInsnNode,
+    TableSwitchInsnNode, TryCatchBlockNode, TypeInsnNode, VarInsnNode,
 };
 use crate::types::Type;
 use crate::{constants, opcodes};
@@ -359,23 +359,104 @@ impl ClassFile {
                 _ => None,
             });
 
-            let (has_code, max_stack, max_locals, instructions, exception_table, code_attributes) =
-                if let Some(code) = code {
-                    let mut list = InsnList::new();
-                    for insn in &code.instructions {
-                        list.add(insn.clone());
+            let (
+                has_code,
+                max_stack,
+                max_locals,
+                instructions,
+                instruction_offsets,
+                insn_nodes,
+                exception_table,
+                try_catch_blocks,
+                line_numbers,
+                local_variables,
+                code_attributes,
+            ) = if let Some(code) = code {
+                let mut list = InsnList::new();
+                let mut instruction_offsets = Vec::with_capacity(code.instructions.len());
+                for insn in &code.instructions {
+                    list.add(insn.clone());
+                }
+                for node in parse_code_instructions_with_offsets(&code.code)? {
+                    instruction_offsets.push(node.offset);
+                }
+                let line_numbers = code
+                    .attributes
+                    .iter()
+                    .find_map(|attr| match attr {
+                        AttributeInfo::LineNumberTable { entries } => Some(entries.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                let local_variables = code
+                    .attributes
+                    .iter()
+                    .find_map(|attr| match attr {
+                        AttributeInfo::LocalVariableTable { entries } => Some(entries.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                (
+                    true,
+                    code.max_stack,
+                    code.max_locals,
+                    list,
+                    instruction_offsets,
+                    code.insn_nodes.clone(),
+                    code.exception_table.clone(),
+                    code.try_catch_blocks.clone(),
+                    line_numbers,
+                    local_variables,
+                    code.attributes.clone(),
+                )
+            } else {
+                (
+                    false,
+                    0,
+                    0,
+                    InsnList::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+            };
+            let method_parameters = method
+                .attributes
+                .iter()
+                .find_map(|attr| match attr {
+                    AttributeInfo::MethodParameters { parameters } => Some(parameters.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let exceptions = method
+                .attributes
+                .iter()
+                .find_map(|attr| match attr {
+                    AttributeInfo::Exceptions {
+                        exception_index_table,
+                    } => Some(exception_index_table),
+                    _ => None,
+                })
+                .map(|entries| -> Result<Vec<String>, ClassReadError> {
+                    let mut values = Vec::with_capacity(entries.len());
+                    for index in entries {
+                        values.push(self.class_name(*index)?.to_string());
                     }
-                    (
-                        true,
-                        code.max_stack,
-                        code.max_locals,
-                        list,
-                        code.exception_table.clone(),
-                        code.attributes.clone(),
-                    )
-                } else {
-                    (false, 0, 0, InsnList::new(), Vec::new(), Vec::new())
-                };
+                    Ok(values)
+                })
+                .transpose()?
+                .unwrap_or_default();
+            let signature = method.attributes.iter().find_map(|attr| match attr {
+                AttributeInfo::Signature { signature_index } => self
+                    .cp_utf8(*signature_index)
+                    .ok()
+                    .map(|value| value.to_string()),
+                _ => None,
+            });
 
             methods.push(crate::nodes::MethodNode {
                 access_flags: method.access_flags,
@@ -385,7 +466,15 @@ impl ClassFile {
                 max_stack,
                 max_locals,
                 instructions,
+                instruction_offsets,
+                insn_nodes,
                 exception_table,
+                try_catch_blocks,
+                line_numbers,
+                local_variables,
+                method_parameters,
+                exceptions,
+                signature,
                 code_attributes,
                 attributes: method_attributes,
             });
@@ -907,7 +996,15 @@ fn parse_attribute(
                 });
             }
             let attributes = read_attributes(&mut reader, cp)?;
-            let (insn_nodes, try_catch_blocks) = build_insn_nodes(&code, &exception_table, cp)?;
+            let (mut insn_nodes, try_catch_blocks, label_by_offset) =
+                build_insn_nodes(&code, &exception_table, cp)?;
+            let line_numbers = attributes.iter().find_map(|attr| match attr {
+                AttributeInfo::LineNumberTable { entries } => Some(entries.as_slice()),
+                _ => None,
+            });
+            if let Some(entries) = line_numbers {
+                insn_nodes = attach_line_numbers(insn_nodes, entries, &label_by_offset);
+            }
             AttributeInfo::Code(CodeAttribute {
                 max_stack,
                 max_locals,
@@ -1739,7 +1836,14 @@ fn build_insn_nodes(
     code: &[u8],
     exception_table: &[ExceptionTableEntry],
     cp: &[CpInfo],
-) -> Result<(Vec<AbstractInsnNode>, Vec<TryCatchBlockNode>), ClassReadError> {
+) -> Result<
+    (
+        Vec<AbstractInsnNode>,
+        Vec<TryCatchBlockNode>,
+        std::collections::HashMap<u16, LabelNode>,
+    ),
+    ClassReadError,
+> {
     let instructions = parse_code_instructions_with_offsets(code)?;
     let mut offsets = std::collections::HashSet::new();
     for instruction in &instructions {
@@ -1810,7 +1914,7 @@ fn build_insn_nodes(
         });
     }
 
-    Ok((nodes, try_catch_blocks))
+    Ok((nodes, try_catch_blocks, label_by_offset))
 }
 
 pub(crate) fn build_insn_nodes_public(
@@ -1818,7 +1922,44 @@ pub(crate) fn build_insn_nodes_public(
     exception_table: &[ExceptionTableEntry],
     cp: &[CpInfo],
 ) -> Result<(Vec<AbstractInsnNode>, Vec<TryCatchBlockNode>), ClassReadError> {
-    build_insn_nodes(code, exception_table, cp)
+    let (nodes, try_catch_blocks, _) = build_insn_nodes(code, exception_table, cp)?;
+    Ok((nodes, try_catch_blocks))
+}
+
+fn attach_line_numbers(
+    nodes: Vec<AbstractInsnNode>,
+    entries: &[LineNumber],
+    label_by_offset: &std::collections::HashMap<u16, LabelNode>,
+) -> Vec<AbstractInsnNode> {
+    let mut lines_by_label = std::collections::HashMap::<usize, Vec<LineNumberInsnNode>>::new();
+    for entry in entries {
+        if let Some(label) = label_by_offset.get(&entry.start_pc) {
+            lines_by_label
+                .entry(label.id)
+                .or_default()
+                .push(LineNumberInsnNode {
+                    line: entry.line_number,
+                    start: *label,
+                });
+        }
+    }
+
+    let mut merged = Vec::with_capacity(nodes.len() + entries.len());
+    for node in nodes {
+        let label_id = match &node {
+            AbstractInsnNode::Label(label) => Some(label.id),
+            _ => None,
+        };
+        merged.push(node);
+        if let Some(label_id) = label_id
+            && let Some(lines) = lines_by_label.remove(&label_id)
+        {
+            for line in lines {
+                merged.push(AbstractInsnNode::LineNumber(line));
+            }
+        }
+    }
+    merged
 }
 
 fn read_table_switch(
@@ -2084,7 +2225,10 @@ impl<'a> ByteReader<'a> {
 
 #[cfg(test)]
 mod tests {
+    use crate::class_writer::ClassWriter;
     use crate::constants::*;
+    use crate::insn::{Label, LabelNode};
+    use crate::opcodes;
 
     use super::*;
     use std::cell::RefCell;
@@ -2348,6 +2492,139 @@ mod tests {
     }
     fn u2(v: u16, out: &mut Vec<u8>) {
         out.extend_from_slice(&v.to_be_bytes());
+    }
+
+    #[test]
+    fn test_method_node_contains_offsets_and_line_numbers() {
+        let mut writer = ClassWriter::new(0);
+        writer.visit(
+            52,
+            0,
+            ACC_PUBLIC,
+            "TestNodeData",
+            Some("java/lang/Object"),
+            &[],
+        );
+
+        let mut ctor = writer.visit_method(ACC_PUBLIC, "<init>", "()V");
+        ctor.visit_code();
+        ctor.visit_var_insn(opcodes::ALOAD, 0);
+        ctor.visit_method_insn(
+            opcodes::INVOKESPECIAL,
+            "java/lang/Object",
+            "<init>",
+            "()V",
+            false,
+        );
+        ctor.visit_insn(opcodes::RETURN);
+        ctor.visit_maxs(1, 1);
+        ctor.visit_end(&mut writer);
+
+        let mut method = writer.visit_method(ACC_PUBLIC | ACC_STATIC, "answer", "()I");
+        let start = Label::new();
+        method.visit_code();
+        method.visit_label(start);
+        method.visit_line_number(123, LabelNode::from_label(start));
+        method.visit_insn(opcodes::ICONST_1);
+        method.visit_insn(opcodes::IRETURN);
+        method.visit_maxs(1, 0);
+        method.visit_end(&mut writer);
+
+        let bytes = writer.to_bytes().expect("class should encode");
+        let class = ClassReader::new(&bytes)
+            .to_class_node()
+            .expect("class should decode");
+        let method = class
+            .methods
+            .iter()
+            .find(|method| method.name == "answer")
+            .expect("method should exist");
+
+        assert_eq!(method.instruction_offsets, vec![0, 1]);
+        assert_eq!(method.line_numbers.len(), 1);
+        assert_eq!(method.line_numbers[0].line_number, 123);
+        assert!(
+            method
+                .insn_nodes
+                .iter()
+                .any(|node| matches!(node, AbstractInsnNode::LineNumber(_)))
+        );
+        assert!(
+            method
+                .insn_nodes
+                .iter()
+                .any(|node| matches!(node, AbstractInsnNode::Label(_)))
+        );
+        assert!(method.try_catch_blocks.is_empty());
+    }
+
+    #[test]
+    fn test_method_node_contains_try_catch_blocks() {
+        let mut writer = ClassWriter::new(0);
+        writer.visit(
+            52,
+            0,
+            ACC_PUBLIC,
+            "TestTryCatchNode",
+            Some("java/lang/Object"),
+            &[],
+        );
+
+        let mut ctor = writer.visit_method(ACC_PUBLIC, "<init>", "()V");
+        ctor.visit_code();
+        ctor.visit_var_insn(opcodes::ALOAD, 0);
+        ctor.visit_method_insn(
+            opcodes::INVOKESPECIAL,
+            "java/lang/Object",
+            "<init>",
+            "()V",
+            false,
+        );
+        ctor.visit_insn(opcodes::RETURN);
+        ctor.visit_maxs(1, 1);
+        ctor.visit_end(&mut writer);
+
+        let start = Label::new();
+        let end = Label::new();
+        let handler = Label::new();
+        let mut method =
+            writer.visit_method(ACC_PUBLIC | ACC_STATIC, "safeLen", "(Ljava/lang/String;)I");
+        method.visit_code();
+        method.visit_label(start);
+        method.visit_var_insn(opcodes::ALOAD, 0);
+        method.visit_method_insn(
+            opcodes::INVOKEVIRTUAL,
+            "java/lang/String",
+            "length",
+            "()I",
+            false,
+        );
+        method.visit_insn(opcodes::IRETURN);
+        method.visit_label(end);
+        method.visit_label(handler);
+        method.visit_var_insn(opcodes::ASTORE, 1);
+        method.visit_insn(opcodes::ICONST_M1);
+        method.visit_insn(opcodes::IRETURN);
+        method.visit_try_catch_block(start, end, handler, Some("java/lang/RuntimeException"));
+        method.visit_maxs(1, 2);
+        method.visit_end(&mut writer);
+
+        let bytes = writer.to_bytes().expect("class should encode");
+        let class = ClassReader::new(&bytes)
+            .to_class_node()
+            .expect("class should decode");
+        let method = class
+            .methods
+            .iter()
+            .find(|method| method.name == "safeLen")
+            .expect("method should exist");
+
+        assert_eq!(method.exception_table.len(), 1);
+        assert_eq!(method.try_catch_blocks.len(), 1);
+        assert_eq!(
+            method.try_catch_blocks[0].catch_type.as_deref(),
+            Some("java/lang/RuntimeException")
+        );
     }
 
     #[test]

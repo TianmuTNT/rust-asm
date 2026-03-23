@@ -10,8 +10,10 @@ use crate::constants;
 use crate::error::ClassWriteError;
 use crate::insn::{
     AbstractInsnNode, BootstrapArgument, FieldInsnNode, Handle, Insn, InsnList, InsnNode,
-    InvokeInterfaceInsnNode, JumpInsnNode, JumpLabelInsnNode, Label, LabelNode, LdcInsnNode,
-    LdcValue, LineNumberInsnNode, MemberRef, MethodInsnNode, NodeList, TypeInsnNode, VarInsnNode,
+    IincInsnNode, InvokeInterfaceInsnNode, JumpInsnNode, JumpLabelInsnNode, Label, LabelNode, LdcInsnNode,
+    LdcValue, LineNumberInsnNode, LookupSwitchInsnNode, LookupSwitchLabelInsnNode, MemberRef,
+    MethodInsnNode, NodeList, TableSwitchInsnNode, TableSwitchLabelInsnNode, TryCatchBlockNode,
+    TypeInsnNode, VarInsnNode,
 };
 use crate::nodes::{ClassNode, FieldNode, InnerClassNode, MethodNode};
 use crate::opcodes;
@@ -44,9 +46,25 @@ struct MethodData {
     max_stack: u16,
     max_locals: u16,
     instructions: InsnList,
+    instruction_offsets: Vec<u16>,
+    insn_nodes: Vec<AbstractInsnNode>,
     exception_table: Vec<ExceptionTableEntry>,
+    try_catch_blocks: Vec<TryCatchBlockNode>,
+    line_numbers: Vec<LineNumber>,
+    local_variables: Vec<LocalVariable>,
+    method_parameters: Vec<MethodParameter>,
+    exceptions: Vec<String>,
+    signature: Option<String>,
     code_attributes: Vec<AttributeInfo>,
     attributes: Vec<AttributeInfo>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingTryCatchBlock {
+    start: LabelNode,
+    end: LabelNode,
+    handler: LabelNode,
+    catch_type: Option<String>,
 }
 
 /// A writer that generates a Java Class File structure.
@@ -154,7 +172,15 @@ impl ClassWriter {
                 max_stack: method.max_stack,
                 max_locals: method.max_locals,
                 instructions: method.instructions,
+                instruction_offsets: method.instruction_offsets,
+                insn_nodes: method.insn_nodes,
                 exception_table: method.exception_table,
+                try_catch_blocks: method.try_catch_blocks,
+                line_numbers: method.line_numbers,
+                local_variables: method.local_variables,
+                method_parameters: method.method_parameters,
+                exceptions: method.exceptions,
+                signature: method.signature,
                 code_attributes: method.code_attributes,
                 attributes: method.attributes,
             });
@@ -388,7 +414,15 @@ impl ClassWriter {
                 max_stack: method.max_stack,
                 max_locals: method.max_locals,
                 instructions: method.instructions,
+                instruction_offsets: method.instruction_offsets,
+                insn_nodes: method.insn_nodes,
                 exception_table: method.exception_table,
+                try_catch_blocks: method.try_catch_blocks,
+                line_numbers: method.line_numbers,
+                local_variables: method.local_variables,
+                method_parameters: method.method_parameters,
+                exceptions: method.exceptions,
+                signature: method.signature,
                 code_attributes: method.code_attributes,
                 attributes: method.attributes,
             });
@@ -516,6 +550,7 @@ pub struct MethodVisitor {
     insns: NodeList,
     pending_type_names: Vec<String>,
     exception_table: Vec<ExceptionTableEntry>,
+    pending_try_catch_blocks: Vec<PendingTryCatchBlock>,
     code_attributes: Vec<AttributeInfo>,
     attributes: Vec<AttributeInfo>,
 }
@@ -532,6 +567,7 @@ impl MethodVisitor {
             insns: NodeList::new(),
             pending_type_names: Vec::new(),
             exception_table: Vec::new(),
+            pending_try_catch_blocks: Vec::new(),
             code_attributes: Vec::new(),
             attributes: Vec::new(),
         }
@@ -633,8 +669,62 @@ impl MethodVisitor {
         self
     }
 
+    pub fn visit_table_switch(
+        &mut self,
+        default: Label,
+        low: i32,
+        high: i32,
+        targets: &[Label],
+    ) -> &mut Self {
+        assert_eq!(
+            targets.len(),
+            if high < low {
+                0
+            } else {
+                (high - low + 1) as usize
+            },
+            "tableswitch target count must match low..=high range"
+        );
+        self.insns.add(TableSwitchLabelInsnNode {
+            insn: opcodes::TABLESWITCH.into(),
+            default_target: LabelNode::from_label(default),
+            low,
+            high,
+            targets: targets.iter().copied().map(LabelNode::from_label).collect(),
+        });
+        self
+    }
+
+    pub fn visit_lookup_switch(&mut self, default: Label, pairs: &[(i32, Label)]) -> &mut Self {
+        self.insns.add(LookupSwitchLabelInsnNode {
+            insn: opcodes::LOOKUPSWITCH.into(),
+            default_target: LabelNode::from_label(default),
+            pairs: pairs
+                .iter()
+                .map(|(key, label)| (*key, LabelNode::from_label(*label)))
+                .collect(),
+        });
+        self
+    }
+
     pub fn visit_label(&mut self, label: Label) -> &mut Self {
         self.insns.add(LabelNode::from_label(label));
+        self
+    }
+
+    pub fn visit_try_catch_block(
+        &mut self,
+        start: Label,
+        end: Label,
+        handler: Label,
+        catch_type: Option<&str>,
+    ) -> &mut Self {
+        self.pending_try_catch_blocks.push(PendingTryCatchBlock {
+            start: LabelNode::from_label(start),
+            end: LabelNode::from_label(end),
+            handler: LabelNode::from_label(handler),
+            catch_type: catch_type.map(str::to_string),
+        });
         self
     }
 
@@ -646,6 +736,15 @@ impl MethodVisitor {
     /// Visits a constant instruction (LDC).
     pub fn visit_ldc_insn(&mut self, value: LdcInsnNode) -> &mut Self {
         self.insns.add(Insn::Ldc(value));
+        self
+    }
+
+    pub fn visit_iinc_insn(&mut self, var_index: u16, increment: i16) -> &mut Self {
+        self.insns.add(Insn::Iinc(IincInsnNode {
+            insn: opcodes::IINC.into(),
+            var_index,
+            increment,
+        }));
         self
     }
 
@@ -700,36 +799,91 @@ impl MethodVisitor {
                 self.insns,
                 &mut class.cp,
                 std::mem::take(&mut self.exception_table),
+                std::mem::take(&mut self.pending_try_catch_blocks),
                 std::mem::take(&mut self.code_attributes),
             ))
         } else {
             None
         };
-        let (has_code, max_stack, max_locals, instructions, exception_table, code_attributes) =
-            if let Some(code) = code {
-                let CodeAttribute {
-                    max_stack,
-                    max_locals,
-                    instructions,
-                    exception_table,
-                    attributes,
-                    ..
-                } = code;
-                let mut list = InsnList::new();
-                for insn in instructions {
-                    list.add(insn);
-                }
-                (
-                    true,
-                    max_stack,
-                    max_locals,
-                    list,
-                    exception_table,
-                    attributes,
-                )
-            } else {
-                (false, 0, 0, InsnList::new(), Vec::new(), Vec::new())
-            };
+        let (
+            has_code,
+            max_stack,
+            max_locals,
+            instructions,
+            instruction_offsets,
+            insn_nodes,
+            exception_table,
+            try_catch_blocks,
+            line_numbers,
+            local_variables,
+            code_attributes,
+        ) = if let Some(code) = code {
+            let CodeAttribute {
+                max_stack,
+                max_locals,
+                instructions,
+                insn_nodes,
+                exception_table,
+                try_catch_blocks,
+                attributes,
+                ..
+            } = code;
+            let mut list = InsnList::new();
+            for insn in instructions {
+                list.add(insn);
+            }
+            let line_numbers = attributes
+                .iter()
+                .find_map(|attr| match attr {
+                    AttributeInfo::LineNumberTable { entries } => Some(entries.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let local_variables = attributes
+                .iter()
+                .find_map(|attr| match attr {
+                    AttributeInfo::LocalVariableTable { entries } => Some(entries.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            (
+                true,
+                max_stack,
+                max_locals,
+                list,
+                Vec::new(),
+                insn_nodes,
+                exception_table,
+                try_catch_blocks,
+                line_numbers,
+                local_variables,
+                attributes,
+            )
+        } else {
+            (
+                false,
+                0,
+                0,
+                InsnList::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+        };
+        let method_parameters = self
+            .attributes
+            .iter()
+            .find_map(|attr| match attr {
+                AttributeInfo::MethodParameters { parameters } => Some(parameters.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let exceptions = Vec::new();
+        let signature = None;
         class.methods.push(MethodData {
             access_flags: self.access_flags,
             name: self.name,
@@ -738,7 +892,15 @@ impl MethodVisitor {
             max_stack,
             max_locals,
             instructions,
+            instruction_offsets,
+            insn_nodes,
             exception_table,
+            try_catch_blocks,
+            line_numbers,
+            local_variables,
+            method_parameters,
+            exceptions,
+            signature,
             code_attributes,
             attributes: std::mem::take(&mut self.attributes),
         });
@@ -820,6 +982,7 @@ pub struct CodeBody {
     max_locals: u16,
     insns: NodeList,
     exception_table: Vec<ExceptionTableEntry>,
+    pending_try_catch_blocks: Vec<PendingTryCatchBlock>,
     attributes: Vec<AttributeInfo>,
 }
 
@@ -830,6 +993,7 @@ impl CodeBody {
             max_locals,
             insns,
             exception_table: Vec::new(),
+            pending_try_catch_blocks: Vec::new(),
             attributes: Vec::new(),
         }
     }
@@ -841,6 +1005,8 @@ impl CodeBody {
         let mut label_offsets: HashMap<usize, u16> = HashMap::new();
         let mut pending_lines: Vec<LineNumberInsnNode> = Vec::new();
         let mut jump_fixups: Vec<JumpFixup> = Vec::new();
+        let mut table_switch_fixups: Vec<TableSwitchFixup> = Vec::new();
+        let mut lookup_switch_fixups: Vec<LookupSwitchFixup> = Vec::new();
         for node in self.insns.into_nodes() {
             match node {
                 AbstractInsnNode::Insn(insn) => {
@@ -882,6 +1048,70 @@ impl CodeBody {
                     pending_lines.push(line);
                     insn_nodes.push(AbstractInsnNode::LineNumber(line));
                 }
+                AbstractInsnNode::TableSwitchLabel(node) => {
+                    let start = code.len();
+                    code.push(node.insn.opcode);
+                    write_switch_padding(&mut code, start);
+                    let default_pos = code.len();
+                    write_i4(&mut code, 0);
+                    write_i4(&mut code, node.low);
+                    write_i4(&mut code, node.high);
+                    let mut target_positions = Vec::with_capacity(node.targets.len());
+                    for _ in &node.targets {
+                        target_positions.push(code.len());
+                        write_i4(&mut code, 0);
+                    }
+                    let insn = Insn::TableSwitch(TableSwitchInsnNode {
+                        insn: node.insn,
+                        default_offset: 0,
+                        low: node.low,
+                        high: node.high,
+                        offsets: vec![0; node.targets.len()],
+                    });
+                    instructions.push(insn.clone());
+                    insn_nodes.push(AbstractInsnNode::Insn(insn));
+                    table_switch_fixups.push(TableSwitchFixup {
+                        start,
+                        default_target: node.default_target,
+                        default_position: default_pos,
+                        targets: node.targets,
+                        target_positions,
+                        low: node.low,
+                        high: node.high,
+                        insn_index: instructions.len() - 1,
+                        node_index: insn_nodes.len() - 1,
+                    });
+                }
+                AbstractInsnNode::LookupSwitchLabel(node) => {
+                    let start = code.len();
+                    code.push(node.insn.opcode);
+                    write_switch_padding(&mut code, start);
+                    let default_pos = code.len();
+                    write_i4(&mut code, 0);
+                    write_i4(&mut code, node.pairs.len() as i32);
+                    let mut pair_positions = Vec::with_capacity(node.pairs.len());
+                    for (key, _) in &node.pairs {
+                        write_i4(&mut code, *key);
+                        pair_positions.push(code.len());
+                        write_i4(&mut code, 0);
+                    }
+                    let insn = Insn::LookupSwitch(LookupSwitchInsnNode {
+                        insn: node.insn,
+                        default_offset: 0,
+                        pairs: node.pairs.iter().map(|(key, _)| (*key, 0)).collect(),
+                    });
+                    instructions.push(insn.clone());
+                    insn_nodes.push(AbstractInsnNode::Insn(insn));
+                    lookup_switch_fixups.push(LookupSwitchFixup {
+                        start,
+                        default_target: node.default_target,
+                        default_position: default_pos,
+                        pairs: node.pairs,
+                        pair_positions,
+                        insn_index: instructions.len() - 1,
+                        node_index: insn_nodes.len() - 1,
+                    });
+                }
             }
         }
         for fixup in jump_fixups {
@@ -902,7 +1132,81 @@ impl CodeBody {
                 insn_nodes[fixup.node_index] = AbstractInsnNode::Insn(resolved);
             }
         }
+        for fixup in table_switch_fixups {
+            if let Some(default_offset) = label_offsets.get(&fixup.default_target.id) {
+                let default_delta = *default_offset as i32 - fixup.start as i32;
+                write_i4_at(&mut code, fixup.default_position, default_delta);
+                let mut offsets = Vec::with_capacity(fixup.targets.len());
+                for (index, target) in fixup.targets.iter().enumerate() {
+                    if let Some(target_offset) = label_offsets.get(&target.id) {
+                        let delta = *target_offset as i32 - fixup.start as i32;
+                        write_i4_at(&mut code, fixup.target_positions[index], delta);
+                        offsets.push(delta);
+                    }
+                }
+                let resolved = Insn::TableSwitch(TableSwitchInsnNode {
+                    insn: opcodes::TABLESWITCH.into(),
+                    default_offset: default_delta,
+                    low: fixup.low,
+                    high: fixup.high,
+                    offsets,
+                });
+                instructions[fixup.insn_index] = resolved.clone();
+                insn_nodes[fixup.node_index] = AbstractInsnNode::Insn(resolved);
+            }
+        }
+        for fixup in lookup_switch_fixups {
+            if let Some(default_offset) = label_offsets.get(&fixup.default_target.id) {
+                let default_delta = *default_offset as i32 - fixup.start as i32;
+                write_i4_at(&mut code, fixup.default_position, default_delta);
+                let mut pairs = Vec::with_capacity(fixup.pairs.len());
+                for (index, (key, target)) in fixup.pairs.iter().enumerate() {
+                    if let Some(target_offset) = label_offsets.get(&target.id) {
+                        let delta = *target_offset as i32 - fixup.start as i32;
+                        write_i4_at(&mut code, fixup.pair_positions[index], delta);
+                        pairs.push((*key, delta));
+                    }
+                }
+                let resolved = Insn::LookupSwitch(LookupSwitchInsnNode {
+                    insn: opcodes::LOOKUPSWITCH.into(),
+                    default_offset: default_delta,
+                    pairs,
+                });
+                instructions[fixup.insn_index] = resolved.clone();
+                insn_nodes[fixup.node_index] = AbstractInsnNode::Insn(resolved);
+            }
+        }
         let mut attributes = self.attributes;
+        let mut exception_table = self.exception_table;
+        let mut try_catch_blocks = Vec::new();
+        for pending in self.pending_try_catch_blocks {
+            let Some(start_pc) = label_offsets.get(&pending.start.id).copied() else {
+                continue;
+            };
+            let Some(end_pc) = label_offsets.get(&pending.end.id).copied() else {
+                continue;
+            };
+            let Some(handler_pc) = label_offsets.get(&pending.handler.id).copied() else {
+                continue;
+            };
+            let catch_type = pending
+                .catch_type
+                .as_deref()
+                .map(|name| cp.class(name))
+                .unwrap_or(0);
+            exception_table.push(ExceptionTableEntry {
+                start_pc,
+                end_pc,
+                handler_pc,
+                catch_type,
+            });
+            try_catch_blocks.push(TryCatchBlockNode {
+                start: pending.start,
+                end: pending.end,
+                handler: pending.handler,
+                catch_type: pending.catch_type,
+            });
+        }
         if !pending_lines.is_empty() {
             let mut entries = Vec::new();
             for line in pending_lines {
@@ -923,8 +1227,8 @@ impl CodeBody {
             code,
             instructions,
             insn_nodes,
-            exception_table: self.exception_table,
-            try_catch_blocks: Vec::new(),
+            exception_table,
+            try_catch_blocks,
             attributes,
         }
     }
@@ -935,6 +1239,30 @@ struct JumpFixup {
     start: usize,
     opcode: u8,
     target: LabelNode,
+    insn_index: usize,
+    node_index: usize,
+}
+
+#[derive(Debug, Clone)]
+struct TableSwitchFixup {
+    start: usize,
+    default_target: LabelNode,
+    default_position: usize,
+    targets: Vec<LabelNode>,
+    target_positions: Vec<usize>,
+    low: i32,
+    high: i32,
+    insn_index: usize,
+    node_index: usize,
+}
+
+#[derive(Debug, Clone)]
+struct LookupSwitchFixup {
+    start: usize,
+    default_target: LabelNode,
+    default_position: usize,
+    pairs: Vec<(i32, LabelNode)>,
+    pair_positions: Vec<usize>,
     insn_index: usize,
     node_index: usize,
 }
@@ -953,6 +1281,7 @@ fn build_code_attribute(
     insns: NodeList,
     cp: &mut ConstantPoolBuilder,
     exception_table: Vec<ExceptionTableEntry>,
+    pending_try_catch_blocks: Vec<PendingTryCatchBlock>,
     attributes: Vec<AttributeInfo>,
 ) -> CodeAttribute {
     CodeBody {
@@ -960,6 +1289,7 @@ fn build_code_attribute(
         max_locals,
         insns,
         exception_table,
+        pending_try_catch_blocks,
         attributes,
     }
     .build(cp)
@@ -1614,15 +1944,34 @@ fn write_method(
 
 fn method_code_attribute(method: &MethodNode) -> Result<CodeAttribute, ClassWriteError> {
     let (code, instructions) = build_code_from_insn_list(&method.instructions)?;
+    let mut attributes = method.code_attributes.clone();
+    if !method.line_numbers.is_empty()
+        && !attributes
+            .iter()
+            .any(|attr| matches!(attr, AttributeInfo::LineNumberTable { .. }))
+    {
+        attributes.push(AttributeInfo::LineNumberTable {
+            entries: method.line_numbers.clone(),
+        });
+    }
+    if !method.local_variables.is_empty()
+        && !attributes
+            .iter()
+            .any(|attr| matches!(attr, AttributeInfo::LocalVariableTable { .. }))
+    {
+        attributes.push(AttributeInfo::LocalVariableTable {
+            entries: method.local_variables.clone(),
+        });
+    }
     Ok(CodeAttribute {
         max_stack: method.max_stack,
         max_locals: method.max_locals,
         code,
         instructions,
-        insn_nodes: Vec::new(),
+        insn_nodes: method.insn_nodes.clone(),
         exception_table: method.exception_table.clone(),
-        try_catch_blocks: Vec::new(),
-        attributes: method.code_attributes.clone(),
+        try_catch_blocks: method.try_catch_blocks.clone(),
+        attributes,
     })
 }
 
