@@ -108,10 +108,22 @@ pub trait MethodVisitor {
     fn visit_end(&mut self) {}
 }
 
+/// A visitor to visit a JPMS module descriptor.
+pub trait ModuleVisitor {
+    fn visit_main_class(&mut self, _main_class: &str) {}
+    fn visit_package(&mut self, _package: &str) {}
+    fn visit_require(&mut self, _module: &str, _access_flags: u16, _version: Option<&str>) {}
+    fn visit_export(&mut self, _package: &str, _access_flags: u16, _modules: &[String]) {}
+    fn visit_open(&mut self, _package: &str, _access_flags: u16, _modules: &[String]) {}
+    fn visit_use(&mut self, _service: &str) {}
+    fn visit_provide(&mut self, _service: &str, _providers: &[String]) {}
+    fn visit_end(&mut self) {}
+}
+
 /// A visitor to visit a Java class.
 ///
 /// The methods of this trait must be called in the following order:
-/// `visit` -> `visit_source` -> (`visit_field` | `visit_method`)* -> `visit_end`.
+/// `visit` -> `visit_source` -> `visit_module` -> (`visit_field` | `visit_method`)* -> `visit_end`.
 pub trait ClassVisitor {
     /// Visits the header of the class.
     ///
@@ -136,6 +148,16 @@ pub trait ClassVisitor {
 
     /// Visits the source file name of the class.
     fn visit_source(&mut self, _source: &str) {}
+
+    /// Visits the JPMS module descriptor of this class, if this is a `module-info.class`.
+    fn visit_module(
+        &mut self,
+        _name: &str,
+        _access_flags: u16,
+        _version: Option<&str>,
+    ) -> Option<Box<dyn ModuleVisitor>> {
+        None
+    }
 
     /// Visits a field of the class.
     ///
@@ -231,6 +253,93 @@ impl ClassReader {
             }
         }
 
+        if let Some(module_attr) = class_file.attributes.iter().find_map(|attr| match attr {
+            AttributeInfo::Module(module) => Some(module),
+            _ => None,
+        }) {
+            let version = if module_attr.module_version_index == 0 {
+                None
+            } else {
+                Some(class_file.cp_utf8(module_attr.module_version_index)?)
+            };
+            if let Some(mut mv) = visitor.visit_module(
+                class_file.module_name(module_attr.module_name_index)?,
+                module_attr.module_flags,
+                version,
+            ) {
+                if let Some(main_class_index) =
+                    class_file.attributes.iter().find_map(|attr| match attr {
+                        AttributeInfo::ModuleMainClass { main_class_index } => {
+                            Some(*main_class_index)
+                        }
+                        _ => None,
+                    })
+                {
+                    mv.visit_main_class(class_file.class_name(main_class_index)?);
+                }
+                if let Some(package_index_table) =
+                    class_file.attributes.iter().find_map(|attr| match attr {
+                        AttributeInfo::ModulePackages {
+                            package_index_table,
+                        } => Some(package_index_table.as_slice()),
+                        _ => None,
+                    })
+                {
+                    for package_index in package_index_table {
+                        mv.visit_package(class_file.package_name(*package_index)?);
+                    }
+                }
+                for require in &module_attr.requires {
+                    let version = if require.requires_version_index == 0 {
+                        None
+                    } else {
+                        Some(class_file.cp_utf8(require.requires_version_index)?)
+                    };
+                    mv.visit_require(
+                        class_file.module_name(require.requires_index)?,
+                        require.requires_flags,
+                        version,
+                    );
+                }
+                for export in &module_attr.exports {
+                    let modules = export
+                        .exports_to_index
+                        .iter()
+                        .map(|index| class_file.module_name(*index).map(str::to_string))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    mv.visit_export(
+                        class_file.package_name(export.exports_index)?,
+                        export.exports_flags,
+                        &modules,
+                    );
+                }
+                for open in &module_attr.opens {
+                    let modules = open
+                        .opens_to_index
+                        .iter()
+                        .map(|index| class_file.module_name(*index).map(str::to_string))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    mv.visit_open(
+                        class_file.package_name(open.opens_index)?,
+                        open.opens_flags,
+                        &modules,
+                    );
+                }
+                for uses_index in &module_attr.uses_index {
+                    mv.visit_use(class_file.class_name(*uses_index)?);
+                }
+                for provide in &module_attr.provides {
+                    let providers = provide
+                        .provides_with_index
+                        .iter()
+                        .map(|index| class_file.class_name(*index).map(str::to_string))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    mv.visit_provide(class_file.class_name(provide.provides_index)?, &providers);
+                }
+                mv.visit_end();
+            }
+        }
+
         for field in &class_file.fields {
             let field_name = class_file.cp_utf8(field.name_index)?;
             let field_desc = class_file.cp_utf8(field.descriptor_index)?;
@@ -313,6 +422,28 @@ impl ClassFile {
             .ok_or(ClassReadError::InvalidIndex(index))?
         {
             CpInfo::Class { name_index } => self.cp_utf8(*name_index),
+            _ => Err(ClassReadError::InvalidIndex(index)),
+        }
+    }
+
+    pub fn module_name(&self, index: u16) -> Result<&str, ClassReadError> {
+        match self
+            .constant_pool
+            .get(index as usize)
+            .ok_or(ClassReadError::InvalidIndex(index))?
+        {
+            CpInfo::Module { name_index } => self.cp_utf8(*name_index),
+            _ => Err(ClassReadError::InvalidIndex(index)),
+        }
+    }
+
+    pub fn package_name(&self, index: u16) -> Result<&str, ClassReadError> {
+        match self
+            .constant_pool
+            .get(index as usize)
+            .ok_or(ClassReadError::InvalidIndex(index))?
+        {
+            CpInfo::Package { name_index } => self.cp_utf8(*name_index),
             _ => Err(ClassReadError::InvalidIndex(index)),
         }
     }
@@ -526,6 +657,125 @@ impl ClassFile {
             }
         }
 
+        let module = self
+            .attributes
+            .iter()
+            .find_map(|attr| match attr {
+                AttributeInfo::Module(module) => Some(module),
+                _ => None,
+            })
+            .map(|module| {
+                let requires = module
+                    .requires
+                    .iter()
+                    .map(|require| {
+                        Ok(crate::nodes::ModuleRequireNode {
+                            module: self.module_name(require.requires_index)?.to_string(),
+                            access_flags: require.requires_flags,
+                            version: if require.requires_version_index == 0 {
+                                None
+                            } else {
+                                Some(self.cp_utf8(require.requires_version_index)?.to_string())
+                            },
+                        })
+                    })
+                    .collect::<Result<Vec<_>, ClassReadError>>()?;
+                let exports = module
+                    .exports
+                    .iter()
+                    .map(|export| {
+                        Ok(crate::nodes::ModuleExportNode {
+                            package: self.package_name(export.exports_index)?.to_string(),
+                            access_flags: export.exports_flags,
+                            modules: export
+                                .exports_to_index
+                                .iter()
+                                .map(|index| self.module_name(*index).map(str::to_string))
+                                .collect::<Result<Vec<_>, ClassReadError>>()?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, ClassReadError>>()?;
+                let opens = module
+                    .opens
+                    .iter()
+                    .map(|open| {
+                        Ok(crate::nodes::ModuleOpenNode {
+                            package: self.package_name(open.opens_index)?.to_string(),
+                            access_flags: open.opens_flags,
+                            modules: open
+                                .opens_to_index
+                                .iter()
+                                .map(|index| self.module_name(*index).map(str::to_string))
+                                .collect::<Result<Vec<_>, ClassReadError>>()?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, ClassReadError>>()?;
+                let provides = module
+                    .provides
+                    .iter()
+                    .map(|provide| {
+                        Ok(crate::nodes::ModuleProvideNode {
+                            service: self.class_name(provide.provides_index)?.to_string(),
+                            providers: provide
+                                .provides_with_index
+                                .iter()
+                                .map(|index| self.class_name(*index).map(str::to_string))
+                                .collect::<Result<Vec<_>, ClassReadError>>()?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, ClassReadError>>()?;
+                let packages = self
+                    .attributes
+                    .iter()
+                    .find_map(|attr| match attr {
+                        AttributeInfo::ModulePackages {
+                            package_index_table,
+                        } => Some(package_index_table),
+                        _ => None,
+                    })
+                    .map(|package_index_table| {
+                        package_index_table
+                            .iter()
+                            .map(|index| self.package_name(*index).map(str::to_string))
+                            .collect::<Result<Vec<_>, ClassReadError>>()
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+                let main_class = self
+                    .attributes
+                    .iter()
+                    .find_map(|attr| match attr {
+                        AttributeInfo::ModuleMainClass { main_class_index } => {
+                            Some(*main_class_index)
+                        }
+                        _ => None,
+                    })
+                    .map(|index| self.class_name(index).map(str::to_string))
+                    .transpose()?;
+
+                Ok(crate::nodes::ModuleNode {
+                    name: self.module_name(module.module_name_index)?.to_string(),
+                    access_flags: module.module_flags,
+                    version: if module.module_version_index == 0 {
+                        None
+                    } else {
+                        Some(self.cp_utf8(module.module_version_index)?.to_string())
+                    },
+                    requires,
+                    exports,
+                    opens,
+                    uses: module
+                        .uses_index
+                        .iter()
+                        .map(|index| self.class_name(*index).map(str::to_string))
+                        .collect::<Result<Vec<_>, ClassReadError>>()?,
+                    provides,
+                    packages,
+                    main_class,
+                })
+            })
+            .transpose()?;
+
         Ok(crate::nodes::ClassNode {
             minor_version: self.minor_version,
             major_version: self.major_version,
@@ -542,6 +792,7 @@ impl ClassFile {
             attributes: self.attributes.clone(),
             inner_classes,
             outer_class,
+            module,
         })
     }
 }
@@ -576,6 +827,9 @@ pub enum AttributeInfo {
     Synthetic,
     InnerClasses { classes: Vec<InnerClass> },
     EnclosingMethod { class_index: u16, method_index: u16 },
+    Module(ModuleAttribute),
+    ModulePackages { package_index_table: Vec<u16> },
+    ModuleMainClass { main_class_index: u16 },
     BootstrapMethods { methods: Vec<BootstrapMethod> },
     MethodParameters { parameters: Vec<MethodParameter> },
     RuntimeVisibleAnnotations { annotations: Vec<Annotation> },
@@ -585,6 +839,45 @@ pub enum AttributeInfo {
     RuntimeVisibleTypeAnnotations { annotations: Vec<TypeAnnotation> },
     RuntimeInvisibleTypeAnnotations { annotations: Vec<TypeAnnotation> },
     Unknown { name: String, info: Vec<u8> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleAttribute {
+    pub module_name_index: u16,
+    pub module_flags: u16,
+    pub module_version_index: u16,
+    pub requires: Vec<ModuleRequire>,
+    pub exports: Vec<ModuleExport>,
+    pub opens: Vec<ModuleOpen>,
+    pub uses_index: Vec<u16>,
+    pub provides: Vec<ModuleProvide>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleRequire {
+    pub requires_index: u16,
+    pub requires_flags: u16,
+    pub requires_version_index: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleExport {
+    pub exports_index: u16,
+    pub exports_flags: u16,
+    pub exports_to_index: Vec<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleOpen {
+    pub opens_index: u16,
+    pub opens_flags: u16,
+    pub opens_to_index: Vec<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleProvide {
+    pub provides_index: u16,
+    pub provides_with_index: Vec<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1143,6 +1436,20 @@ fn parse_attribute(
             class_index: reader.read_u2()?,
             method_index: reader.read_u2()?,
         },
+        "Module" => AttributeInfo::Module(parse_module_attribute(&mut reader)?),
+        "ModulePackages" => {
+            let count = reader.read_u2()? as usize;
+            let mut package_index_table = Vec::with_capacity(count);
+            for _ in 0..count {
+                package_index_table.push(reader.read_u2()?);
+            }
+            AttributeInfo::ModulePackages {
+                package_index_table,
+            }
+        }
+        "ModuleMainClass" => AttributeInfo::ModuleMainClass {
+            main_class_index: reader.read_u2()?,
+        },
         "BootstrapMethods" => {
             let count = reader.read_u2()? as usize;
             let mut methods = Vec::with_capacity(count);
@@ -1208,6 +1515,88 @@ fn parse_attribute(
     }
 
     Ok(attribute)
+}
+
+fn parse_module_attribute(reader: &mut ByteReader<'_>) -> Result<ModuleAttribute, ClassReadError> {
+    let module_name_index = reader.read_u2()?;
+    let module_flags = reader.read_u2()?;
+    let module_version_index = reader.read_u2()?;
+
+    let requires_count = reader.read_u2()? as usize;
+    let mut requires = Vec::with_capacity(requires_count);
+    for _ in 0..requires_count {
+        requires.push(ModuleRequire {
+            requires_index: reader.read_u2()?,
+            requires_flags: reader.read_u2()?,
+            requires_version_index: reader.read_u2()?,
+        });
+    }
+
+    let exports_count = reader.read_u2()? as usize;
+    let mut exports = Vec::with_capacity(exports_count);
+    for _ in 0..exports_count {
+        let exports_index = reader.read_u2()?;
+        let exports_flags = reader.read_u2()?;
+        let exports_to_count = reader.read_u2()? as usize;
+        let mut exports_to_index = Vec::with_capacity(exports_to_count);
+        for _ in 0..exports_to_count {
+            exports_to_index.push(reader.read_u2()?);
+        }
+        exports.push(ModuleExport {
+            exports_index,
+            exports_flags,
+            exports_to_index,
+        });
+    }
+
+    let opens_count = reader.read_u2()? as usize;
+    let mut opens = Vec::with_capacity(opens_count);
+    for _ in 0..opens_count {
+        let opens_index = reader.read_u2()?;
+        let opens_flags = reader.read_u2()?;
+        let opens_to_count = reader.read_u2()? as usize;
+        let mut opens_to_index = Vec::with_capacity(opens_to_count);
+        for _ in 0..opens_to_count {
+            opens_to_index.push(reader.read_u2()?);
+        }
+        opens.push(ModuleOpen {
+            opens_index,
+            opens_flags,
+            opens_to_index,
+        });
+    }
+
+    let uses_count = reader.read_u2()? as usize;
+    let mut uses_index = Vec::with_capacity(uses_count);
+    for _ in 0..uses_count {
+        uses_index.push(reader.read_u2()?);
+    }
+
+    let provides_count = reader.read_u2()? as usize;
+    let mut provides = Vec::with_capacity(provides_count);
+    for _ in 0..provides_count {
+        let provides_index = reader.read_u2()?;
+        let provides_with_count = reader.read_u2()? as usize;
+        let mut provides_with_index = Vec::with_capacity(provides_with_count);
+        for _ in 0..provides_with_count {
+            provides_with_index.push(reader.read_u2()?);
+        }
+        provides.push(ModuleProvide {
+            provides_index,
+            provides_with_index,
+        });
+    }
+
+    Ok(ModuleAttribute {
+        module_name_index,
+        module_flags,
+        module_version_index,
+        requires,
+        exports,
+        opens,
+        uses_index,
+        provides,
+    })
 }
 
 fn parse_annotations(reader: &mut ByteReader) -> Result<Vec<Annotation>, ClassReadError> {
@@ -2329,6 +2718,29 @@ mod tests {
         w
     }
 
+    fn generate_module_info_class() -> Vec<u8> {
+        let mut writer = ClassWriter::new(0);
+        writer.visit(V9, 0, ACC_MODULE, "module-info", None, &[]);
+
+        let mut module = writer.visit_module("com.example.app", ACC_OPEN, Some("1.0"));
+        module.visit_main_class("com/example/app/Main");
+        module.visit_package("com/example/api");
+        module.visit_package("com/example/internal");
+        module.visit_require("java.base", ACC_MANDATED, None);
+        module.visit_require(
+            "com.example.lib",
+            ACC_TRANSITIVE | ACC_STATIC_PHASE,
+            Some("2.1"),
+        );
+        module.visit_export("com/example/api", 0, &["com.example.consumer"]);
+        module.visit_open("com/example/internal", 0, &["com.example.runtime"]);
+        module.visit_use("com/example/spi/Service");
+        module.visit_provide("com/example/spi/Service", &["com/example/impl/ServiceImpl"]);
+        module.visit_end(&mut writer);
+
+        writer.to_bytes().expect("module-info should encode")
+    }
+
     #[test]
     fn test_class_reader_header() {
         let bytes = generate_minimal_class();
@@ -2482,6 +2894,104 @@ mod tests {
                     }
                     other => panic!("unexpected target_info: {:?}", other),
                 }
+            }
+            other => panic!("unexpected attr: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_module_attribute_family() {
+        let mut module_info = vec![];
+        u2(1, &mut module_info);
+        u2(ACC_OPEN, &mut module_info);
+        u2(2, &mut module_info);
+        u2(1, &mut module_info);
+        u2(3, &mut module_info);
+        u2(ACC_TRANSITIVE | ACC_STATIC_PHASE, &mut module_info);
+        u2(4, &mut module_info);
+        u2(1, &mut module_info);
+        u2(5, &mut module_info);
+        u2(ACC_MANDATED, &mut module_info);
+        u2(2, &mut module_info);
+        u2(6, &mut module_info);
+        u2(7, &mut module_info);
+        u2(1, &mut module_info);
+        u2(8, &mut module_info);
+        u2(0, &mut module_info);
+        u2(1, &mut module_info);
+        u2(9, &mut module_info);
+        u2(1, &mut module_info);
+        u2(10, &mut module_info);
+        u2(1, &mut module_info);
+        u2(11, &mut module_info);
+        u2(2, &mut module_info);
+        u2(12, &mut module_info);
+        u2(13, &mut module_info);
+
+        let attr = parse_attribute("Module", module_info, &[]).expect("module attr should parse");
+        match attr {
+            AttributeInfo::Module(module) => {
+                assert_eq!(module.module_name_index, 1);
+                assert_eq!(module.module_flags, ACC_OPEN);
+                assert_eq!(module.module_version_index, 2);
+                assert_eq!(
+                    module.requires,
+                    vec![ModuleRequire {
+                        requires_index: 3,
+                        requires_flags: ACC_TRANSITIVE | ACC_STATIC_PHASE,
+                        requires_version_index: 4,
+                    }]
+                );
+                assert_eq!(
+                    module.exports,
+                    vec![ModuleExport {
+                        exports_index: 5,
+                        exports_flags: ACC_MANDATED,
+                        exports_to_index: vec![6, 7],
+                    }]
+                );
+                assert_eq!(
+                    module.opens,
+                    vec![ModuleOpen {
+                        opens_index: 8,
+                        opens_flags: 0,
+                        opens_to_index: vec![9],
+                    }]
+                );
+                assert_eq!(module.uses_index, vec![10]);
+                assert_eq!(
+                    module.provides,
+                    vec![ModuleProvide {
+                        provides_index: 11,
+                        provides_with_index: vec![12, 13],
+                    }]
+                );
+            }
+            other => panic!("unexpected attr: {:?}", other),
+        }
+
+        let mut packages_info = vec![];
+        u2(2, &mut packages_info);
+        u2(21, &mut packages_info);
+        u2(22, &mut packages_info);
+        let attr = parse_attribute("ModulePackages", packages_info, &[])
+            .expect("module packages attr should parse");
+        match attr {
+            AttributeInfo::ModulePackages {
+                package_index_table,
+            } => {
+                assert_eq!(package_index_table, vec![21, 22]);
+            }
+            other => panic!("unexpected attr: {:?}", other),
+        }
+
+        let mut main_class_info = vec![];
+        u2(23, &mut main_class_info);
+        let attr = parse_attribute("ModuleMainClass", main_class_info, &[])
+            .expect("module main class attr should parse");
+        match attr {
+            AttributeInfo::ModuleMainClass { main_class_index } => {
+                assert_eq!(main_class_index, 23);
             }
             other => panic!("unexpected attr: {:?}", other),
         }
@@ -2670,5 +3180,58 @@ mod tests {
             }
             other => panic!("unexpected attr: {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_class_reader_decodes_module_info_node() {
+        let bytes = generate_module_info_class();
+        let class = ClassReader::new(&bytes)
+            .to_class_node()
+            .expect("module-info should decode");
+
+        assert_eq!(class.name, "module-info");
+        assert_eq!(class.access_flags, ACC_MODULE);
+
+        let module = class.module.expect("module descriptor should be decoded");
+        assert_eq!(module.name, "com.example.app");
+        assert_eq!(module.access_flags, ACC_OPEN);
+        assert_eq!(module.version.as_deref(), Some("1.0"));
+        assert_eq!(module.main_class.as_deref(), Some("com/example/app/Main"));
+        assert_eq!(
+            module.packages,
+            vec![
+                "com/example/api".to_string(),
+                "com/example/internal".to_string()
+            ]
+        );
+        assert_eq!(module.requires.len(), 2);
+        assert_eq!(module.requires[0].module, "java.base");
+        assert_eq!(module.requires[0].access_flags, ACC_MANDATED);
+        assert_eq!(module.requires[0].version, None);
+        assert_eq!(module.requires[1].module, "com.example.lib");
+        assert_eq!(
+            module.requires[1].access_flags,
+            ACC_TRANSITIVE | ACC_STATIC_PHASE
+        );
+        assert_eq!(module.requires[1].version.as_deref(), Some("2.1"));
+        assert_eq!(module.exports.len(), 1);
+        assert_eq!(module.exports[0].package, "com/example/api");
+        assert_eq!(
+            module.exports[0].modules,
+            vec!["com.example.consumer".to_string()]
+        );
+        assert_eq!(module.opens.len(), 1);
+        assert_eq!(module.opens[0].package, "com/example/internal");
+        assert_eq!(
+            module.opens[0].modules,
+            vec!["com.example.runtime".to_string()]
+        );
+        assert_eq!(module.uses, vec!["com/example/spi/Service".to_string()]);
+        assert_eq!(module.provides.len(), 1);
+        assert_eq!(module.provides[0].service, "com/example/spi/Service");
+        assert_eq!(
+            module.provides[0].providers,
+            vec!["com/example/impl/ServiceImpl".to_string()]
+        );
     }
 }

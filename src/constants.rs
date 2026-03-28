@@ -69,6 +69,12 @@ pub const ACC_ANNOTATION: u16 = 0x2000;
 pub const ACC_ENUM: u16 = 0x4000;
 pub const ACC_MODULE: u16 = 0x8000;
 
+// JPMS-specific aliases. The same raw bit values are context dependent.
+pub const ACC_OPEN: u16 = 0x0020;
+pub const ACC_TRANSITIVE: u16 = 0x0020;
+pub const ACC_STATIC_PHASE: u16 = 0x0040;
+pub const ACC_MANDATED: u16 = 0x8000;
+
 //method handle info
 pub const REF_GET_FIELD: u8 = 1;
 pub const REF_GET_STATIC: u8 = 2;

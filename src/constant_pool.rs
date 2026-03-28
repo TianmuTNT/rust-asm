@@ -10,6 +10,8 @@ pub struct ConstantPoolBuilder {
     cp: Vec<CpInfo>,
     utf8: HashMap<String, u16>,
     class: HashMap<String, u16>,
+    module: HashMap<String, u16>,
+    package: HashMap<String, u16>,
     string: HashMap<String, u16>,
     name_and_type: HashMap<(String, String), u16>,
     field_ref: HashMap<(String, String, String), u16>,
@@ -56,6 +58,20 @@ impl ConstantPoolBuilder {
         fn cp_class_name(cp: &[CpInfo], index: u16) -> Option<&str> {
             match cp.get(index as usize) {
                 Some(CpInfo::Class { name_index }) => cp_utf8(cp, *name_index),
+                _ => None,
+            }
+        }
+
+        fn cp_module_name(cp: &[CpInfo], index: u16) -> Option<&str> {
+            match cp.get(index as usize) {
+                Some(CpInfo::Module { name_index }) => cp_utf8(cp, *name_index),
+                _ => None,
+            }
+        }
+
+        fn cp_package_name(cp: &[CpInfo], index: u16) -> Option<&str> {
+            match cp.get(index as usize) {
+                Some(CpInfo::Package { name_index }) => cp_utf8(cp, *name_index),
                 _ => None,
             }
         }
@@ -113,6 +129,16 @@ impl ConstantPoolBuilder {
                 CpInfo::Class { name_index } => {
                     if let Some(name) = cp_utf8(&builder.cp, *name_index) {
                         builder.class.entry(name.to_string()).or_insert(index);
+                    }
+                }
+                CpInfo::Module { .. } => {
+                    if let Some(name) = cp_module_name(&builder.cp, index) {
+                        builder.module.entry(name.to_string()).or_insert(index);
+                    }
+                }
+                CpInfo::Package { .. } => {
+                    if let Some(name) = cp_package_name(&builder.cp, index) {
+                        builder.package.entry(name.to_string()).or_insert(index);
                     }
                 }
                 CpInfo::String { string_index } => {
@@ -244,6 +270,32 @@ impl ConstantPoolBuilder {
         let name_index = self.utf8(name);
         let index = self.push(CpInfo::Class { name_index });
         self.class.insert(name.to_string(), index);
+        index
+    }
+
+    /// Adds a Module constant to the pool.
+    ///
+    /// The name is the module name string stored in `CONSTANT_Utf8_info`.
+    pub fn module(&mut self, name: &str) -> u16 {
+        if let Some(index) = self.module.get(name) {
+            return *index;
+        }
+        let name_index = self.utf8(name);
+        let index = self.push(CpInfo::Module { name_index });
+        self.module.insert(name.to_string(), index);
+        index
+    }
+
+    /// Adds a Package constant to the pool.
+    ///
+    /// The name uses JVM package format such as `java/lang`.
+    pub fn package(&mut self, name: &str) -> u16 {
+        if let Some(index) = self.package.get(name) {
+            return *index;
+        }
+        let name_index = self.utf8(name);
+        let index = self.push(CpInfo::Package { name_index });
+        self.package.insert(name.to_string(), index);
         index
     }
 

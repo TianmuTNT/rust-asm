@@ -64,6 +64,9 @@ pub struct ClassNode {
     ///
     /// This value is empty when no enclosing class information is available.
     pub outer_class: String,
+
+    /// Decoded JPMS module descriptor data for `module-info.class`, if present.
+    pub module: Option<ModuleNode>,
 }
 
 impl ClassNode {
@@ -84,6 +87,7 @@ impl ClassNode {
             attributes: Vec::new(),
             inner_classes: Vec::new(),
             outer_class: String::new(),
+            module: None,
         }
     }
 }
@@ -102,6 +106,67 @@ pub struct InnerClassNode {
 
     /// The access flags of the inner class as declared in source.
     pub access_flags: u16,
+}
+
+/// Decoded JPMS module descriptor from the `Module` attribute family.
+#[derive(Debug, Clone)]
+pub struct ModuleNode {
+    /// Module name, e.g. `java.base` or `com.example.app`.
+    pub name: String,
+
+    /// Raw module access flags from the `Module` attribute header.
+    pub access_flags: u16,
+
+    /// Optional module version string.
+    pub version: Option<String>,
+
+    /// `requires` directives.
+    pub requires: Vec<ModuleRequireNode>,
+
+    /// `exports` directives.
+    pub exports: Vec<ModuleExportNode>,
+
+    /// `opens` directives.
+    pub opens: Vec<ModuleOpenNode>,
+
+    /// `uses` directives as internal class names.
+    pub uses: Vec<String>,
+
+    /// `provides ... with ...` directives.
+    pub provides: Vec<ModuleProvideNode>,
+
+    /// Optional `ModulePackages` attribute contents.
+    pub packages: Vec<String>,
+
+    /// Optional `ModuleMainClass` attribute contents.
+    pub main_class: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModuleRequireNode {
+    pub module: String,
+    pub access_flags: u16,
+    pub version: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModuleExportNode {
+    pub package: String,
+    pub access_flags: u16,
+    pub modules: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModuleOpenNode {
+    pub package: String,
+    pub access_flags: u16,
+    pub modules: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModuleProvideNode {
+    pub service: String,
+    pub providers: Vec<String>,
 }
 
 /// Represents a field (member variable) within a class.

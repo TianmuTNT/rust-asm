@@ -2,20 +2,24 @@ use std::collections::HashMap;
 
 use crate::class_reader::{
     Annotation, AttributeInfo, BootstrapMethod, CodeAttribute, ElementValue, ExceptionTableEntry,
-    InnerClass, LineNumber, LocalVariable, MethodParameter, ParameterAnnotations, StackMapFrame,
-    TypeAnnotation, TypeAnnotationTargetInfo, TypePath, VerificationTypeInfo,
+    InnerClass, LineNumber, LocalVariable, MethodParameter, ModuleAttribute, ModuleExport,
+    ModuleOpen, ModuleProvide, ModuleRequire, ParameterAnnotations, StackMapFrame, TypeAnnotation,
+    TypeAnnotationTargetInfo, TypePath, VerificationTypeInfo,
 };
 use crate::constant_pool::{ConstantPoolBuilder, CpInfo};
 use crate::constants;
 use crate::error::ClassWriteError;
 use crate::insn::{
-    AbstractInsnNode, BootstrapArgument, FieldInsnNode, Handle, Insn, InsnList, InsnNode,
-    IincInsnNode, InvokeInterfaceInsnNode, JumpInsnNode, JumpLabelInsnNode, Label, LabelNode, LdcInsnNode,
-    LdcValue, LineNumberInsnNode, LookupSwitchInsnNode, LookupSwitchLabelInsnNode, MemberRef,
-    MethodInsnNode, NodeList, TableSwitchInsnNode, TableSwitchLabelInsnNode, TryCatchBlockNode,
-    TypeInsnNode, VarInsnNode,
+    AbstractInsnNode, BootstrapArgument, FieldInsnNode, Handle, IincInsnNode, Insn, InsnList,
+    InsnNode, InvokeInterfaceInsnNode, JumpInsnNode, JumpLabelInsnNode, Label, LabelNode,
+    LdcInsnNode, LdcValue, LineNumberInsnNode, LookupSwitchInsnNode, LookupSwitchLabelInsnNode,
+    MemberRef, MethodInsnNode, NodeList, TableSwitchInsnNode, TableSwitchLabelInsnNode,
+    TryCatchBlockNode, TypeInsnNode, VarInsnNode,
 };
-use crate::nodes::{ClassNode, FieldNode, InnerClassNode, MethodNode};
+use crate::nodes::{
+    ClassNode, FieldNode, InnerClassNode, MethodNode, ModuleExportNode, ModuleNode, ModuleOpenNode,
+    ModuleProvideNode, ModuleRequireNode,
+};
 use crate::opcodes;
 use crate::types::Type;
 
@@ -143,6 +147,7 @@ impl ClassWriter {
             methods,
             mut attributes,
             inner_classes,
+            module,
             ..
         } = class_node;
 
@@ -213,6 +218,13 @@ impl ClassWriter {
             attributes.push(AttributeInfo::InnerClasses { classes });
         }
 
+        let has_module = attributes
+            .iter()
+            .any(|attr| matches!(attr, AttributeInfo::Module(_)));
+        if !has_module && let Some(module) = module.as_ref() {
+            attributes.extend(build_module_attributes(&mut cp, module));
+        }
+
         Self {
             options,
             minor_version,
@@ -265,6 +277,16 @@ impl ClassWriter {
     pub fn visit_source_file(&mut self, name: &str) -> &mut Self {
         self.source_file = Some(name.to_string());
         self
+    }
+
+    /// Starts visiting a JPMS module descriptor for `module-info.class`.
+    pub fn visit_module(
+        &mut self,
+        name: &str,
+        access_flags: u16,
+        version: Option<&str>,
+    ) -> ModuleWriter {
+        ModuleWriter::new(name, access_flags, version, self as *mut ClassWriter)
     }
 
     /// Adds an `InnerClasses` entry for this class.
@@ -498,6 +520,8 @@ impl ClassWriter {
             }
         }
 
+        let module = decode_module_node(&constant_pool, &self.attributes)?;
+
         Ok(ClassNode {
             minor_version: self.minor_version,
             major_version: self.major_version,
@@ -514,6 +538,7 @@ impl ClassWriter {
             attributes: self.attributes,
             inner_classes,
             outer_class,
+            module,
         })
     }
     /// Generates the raw byte vector representing the .class file.
@@ -533,6 +558,145 @@ impl ClassWriter {
         options: u32,
     ) -> Result<Vec<u8>, ClassWriteError> {
         ClassFileWriter::new(options).to_bytes(class_node)
+    }
+}
+
+/// A visitor-style builder for a JPMS module descriptor.
+pub struct ModuleWriter {
+    module: ModuleNode,
+    class_ptr: Option<*mut ClassWriter>,
+    committed: bool,
+}
+
+impl ModuleWriter {
+    fn new(
+        name: &str,
+        access_flags: u16,
+        version: Option<&str>,
+        class_ptr: *mut ClassWriter,
+    ) -> Self {
+        Self {
+            module: ModuleNode {
+                name: name.to_string(),
+                access_flags,
+                version: version.map(str::to_string),
+                requires: Vec::new(),
+                exports: Vec::new(),
+                opens: Vec::new(),
+                uses: Vec::new(),
+                provides: Vec::new(),
+                packages: Vec::new(),
+                main_class: None,
+            },
+            class_ptr: Some(class_ptr),
+            committed: false,
+        }
+    }
+
+    pub fn visit_main_class(&mut self, main_class: &str) -> &mut Self {
+        self.module.main_class = Some(main_class.to_string());
+        self
+    }
+
+    pub fn visit_package(&mut self, package: &str) -> &mut Self {
+        self.module.packages.push(package.to_string());
+        self
+    }
+
+    pub fn visit_require(
+        &mut self,
+        module: &str,
+        access_flags: u16,
+        version: Option<&str>,
+    ) -> &mut Self {
+        self.module.requires.push(ModuleRequireNode {
+            module: module.to_string(),
+            access_flags,
+            version: version.map(str::to_string),
+        });
+        self
+    }
+
+    pub fn visit_export(
+        &mut self,
+        package: &str,
+        access_flags: u16,
+        modules: &[&str],
+    ) -> &mut Self {
+        self.module.exports.push(ModuleExportNode {
+            package: package.to_string(),
+            access_flags,
+            modules: modules.iter().map(|module| (*module).to_string()).collect(),
+        });
+        self
+    }
+
+    pub fn visit_open(&mut self, package: &str, access_flags: u16, modules: &[&str]) -> &mut Self {
+        self.module.opens.push(ModuleOpenNode {
+            package: package.to_string(),
+            access_flags,
+            modules: modules.iter().map(|module| (*module).to_string()).collect(),
+        });
+        self
+    }
+
+    pub fn visit_use(&mut self, service: &str) -> &mut Self {
+        self.module.uses.push(service.to_string());
+        self
+    }
+
+    pub fn visit_provide(&mut self, service: &str, providers: &[&str]) -> &mut Self {
+        self.module.provides.push(ModuleProvideNode {
+            service: service.to_string(),
+            providers: providers
+                .iter()
+                .map(|provider| (*provider).to_string())
+                .collect(),
+        });
+        self
+    }
+
+    pub fn visit_end(mut self, class: &mut ClassWriter) {
+        class.attributes.retain(|attr| {
+            !matches!(
+                attr,
+                AttributeInfo::Module(_)
+                    | AttributeInfo::ModulePackages { .. }
+                    | AttributeInfo::ModuleMainClass { .. }
+            )
+        });
+        class
+            .attributes
+            .extend(build_module_attributes(&mut class.cp, &self.module));
+        self.committed = true;
+        self.class_ptr = None;
+    }
+}
+
+impl Drop for ModuleWriter {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let Some(ptr) = self.class_ptr else {
+            return;
+        };
+        unsafe {
+            let class = &mut *ptr;
+            class.attributes.retain(|attr| {
+                !matches!(
+                    attr,
+                    AttributeInfo::Module(_)
+                        | AttributeInfo::ModulePackages { .. }
+                        | AttributeInfo::ModuleMainClass { .. }
+                )
+            });
+            class
+                .attributes
+                .extend(build_module_attributes(&mut class.cp, &self.module));
+        }
+        self.committed = true;
+        self.class_ptr = None;
     }
 }
 
@@ -1776,6 +1940,15 @@ impl ClassFileWriter {
                 sourcefile_index: source_index,
             });
         }
+        if !class_attributes
+            .iter()
+            .any(|attr| matches!(attr, AttributeInfo::Module(_)))
+            && let Some(module) = class_node.module.as_ref()
+        {
+            let mut builder = ConstantPoolBuilder::from_pool(cp);
+            class_attributes.extend(build_module_attributes(&mut builder, module));
+            cp = builder.into_pool();
+        }
 
         let mut attribute_names = Vec::new();
         collect_attribute_names(&class_attributes, &mut attribute_names);
@@ -1975,6 +2148,245 @@ fn method_code_attribute(method: &MethodNode) -> Result<CodeAttribute, ClassWrit
     })
 }
 
+fn build_module_attributes(
+    cp: &mut ConstantPoolBuilder,
+    module: &ModuleNode,
+) -> Vec<AttributeInfo> {
+    let requires = module
+        .requires
+        .iter()
+        .map(|require| ModuleRequire {
+            requires_index: cp.module(&require.module),
+            requires_flags: require.access_flags,
+            requires_version_index: require
+                .version
+                .as_deref()
+                .map(|version| cp.utf8(version))
+                .unwrap_or(0),
+        })
+        .collect();
+    let exports = module
+        .exports
+        .iter()
+        .map(|export| ModuleExport {
+            exports_index: cp.package(&export.package),
+            exports_flags: export.access_flags,
+            exports_to_index: export
+                .modules
+                .iter()
+                .map(|module| cp.module(module))
+                .collect(),
+        })
+        .collect();
+    let opens = module
+        .opens
+        .iter()
+        .map(|open| ModuleOpen {
+            opens_index: cp.package(&open.package),
+            opens_flags: open.access_flags,
+            opens_to_index: open
+                .modules
+                .iter()
+                .map(|module| cp.module(module))
+                .collect(),
+        })
+        .collect();
+    let uses_index = module
+        .uses
+        .iter()
+        .map(|service| cp.class(service))
+        .collect();
+    let provides = module
+        .provides
+        .iter()
+        .map(|provide| ModuleProvide {
+            provides_index: cp.class(&provide.service),
+            provides_with_index: provide
+                .providers
+                .iter()
+                .map(|provider| cp.class(provider))
+                .collect(),
+        })
+        .collect();
+
+    let mut attributes = vec![AttributeInfo::Module(ModuleAttribute {
+        module_name_index: cp.module(&module.name),
+        module_flags: module.access_flags,
+        module_version_index: module
+            .version
+            .as_deref()
+            .map(|version| cp.utf8(version))
+            .unwrap_or(0),
+        requires,
+        exports,
+        opens,
+        uses_index,
+        provides,
+    })];
+
+    if !module.packages.is_empty() {
+        attributes.push(AttributeInfo::ModulePackages {
+            package_index_table: module
+                .packages
+                .iter()
+                .map(|package| cp.package(package))
+                .collect(),
+        });
+    }
+    if let Some(main_class) = module.main_class.as_deref() {
+        attributes.push(AttributeInfo::ModuleMainClass {
+            main_class_index: cp.class(main_class),
+        });
+    }
+
+    attributes
+}
+
+fn decode_module_node(
+    cp: &[CpInfo],
+    attributes: &[AttributeInfo],
+) -> Result<Option<ModuleNode>, String> {
+    let Some(module) = attributes.iter().find_map(|attr| match attr {
+        AttributeInfo::Module(module) => Some(module),
+        _ => None,
+    }) else {
+        return Ok(None);
+    };
+
+    let requires = module
+        .requires
+        .iter()
+        .map(|require| {
+            Ok(ModuleRequireNode {
+                module: cp_module_name_raw(cp, require.requires_index)?.to_string(),
+                access_flags: require.requires_flags,
+                version: if require.requires_version_index == 0 {
+                    None
+                } else {
+                    Some(cp_utf8_value_raw(cp, require.requires_version_index)?.to_string())
+                },
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let exports = module
+        .exports
+        .iter()
+        .map(|export| {
+            Ok(ModuleExportNode {
+                package: cp_package_name_raw(cp, export.exports_index)?.to_string(),
+                access_flags: export.exports_flags,
+                modules: export
+                    .exports_to_index
+                    .iter()
+                    .map(|index| cp_module_name_raw(cp, *index).map(str::to_string))
+                    .collect::<Result<Vec<_>, String>>()?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let opens = module
+        .opens
+        .iter()
+        .map(|open| {
+            Ok(ModuleOpenNode {
+                package: cp_package_name_raw(cp, open.opens_index)?.to_string(),
+                access_flags: open.opens_flags,
+                modules: open
+                    .opens_to_index
+                    .iter()
+                    .map(|index| cp_module_name_raw(cp, *index).map(str::to_string))
+                    .collect::<Result<Vec<_>, String>>()?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let provides = module
+        .provides
+        .iter()
+        .map(|provide| {
+            Ok(ModuleProvideNode {
+                service: cp_class_name_raw(cp, provide.provides_index)?.to_string(),
+                providers: provide
+                    .provides_with_index
+                    .iter()
+                    .map(|index| cp_class_name_raw(cp, *index).map(str::to_string))
+                    .collect::<Result<Vec<_>, String>>()?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let packages = attributes
+        .iter()
+        .find_map(|attr| match attr {
+            AttributeInfo::ModulePackages {
+                package_index_table,
+            } => Some(package_index_table),
+            _ => None,
+        })
+        .map(|package_index_table| {
+            package_index_table
+                .iter()
+                .map(|index| cp_package_name_raw(cp, *index).map(str::to_string))
+                .collect::<Result<Vec<_>, String>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let main_class = attributes
+        .iter()
+        .find_map(|attr| match attr {
+            AttributeInfo::ModuleMainClass { main_class_index } => Some(*main_class_index),
+            _ => None,
+        })
+        .map(|index| cp_class_name_raw(cp, index).map(str::to_string))
+        .transpose()?;
+
+    Ok(Some(ModuleNode {
+        name: cp_module_name_raw(cp, module.module_name_index)?.to_string(),
+        access_flags: module.module_flags,
+        version: if module.module_version_index == 0 {
+            None
+        } else {
+            Some(cp_utf8_value_raw(cp, module.module_version_index)?.to_string())
+        },
+        requires,
+        exports,
+        opens,
+        uses: module
+            .uses_index
+            .iter()
+            .map(|index| cp_class_name_raw(cp, *index).map(str::to_string))
+            .collect::<Result<Vec<_>, String>>()?,
+        provides,
+        packages,
+        main_class,
+    }))
+}
+
+fn cp_utf8_value_raw(cp: &[CpInfo], index: u16) -> Result<&str, String> {
+    match cp.get(index as usize) {
+        Some(CpInfo::Utf8(value)) => Ok(value.as_str()),
+        _ => Err(format!("invalid constant pool utf8 index {}", index)),
+    }
+}
+
+fn cp_class_name_raw(cp: &[CpInfo], index: u16) -> Result<&str, String> {
+    match cp.get(index as usize) {
+        Some(CpInfo::Class { name_index }) => cp_utf8_value_raw(cp, *name_index),
+        _ => Err(format!("invalid constant pool class index {}", index)),
+    }
+}
+
+fn cp_module_name_raw(cp: &[CpInfo], index: u16) -> Result<&str, String> {
+    match cp.get(index as usize) {
+        Some(CpInfo::Module { name_index }) => cp_utf8_value_raw(cp, *name_index),
+        _ => Err(format!("invalid constant pool module index {}", index)),
+    }
+}
+
+fn cp_package_name_raw(cp: &[CpInfo], index: u16) -> Result<&str, String> {
+    match cp.get(index as usize) {
+        Some(CpInfo::Package { name_index }) => cp_utf8_value_raw(cp, *name_index),
+        _ => Err(format!("invalid constant pool package index {}", index)),
+    }
+}
+
 fn write_attribute(
     out: &mut Vec<u8>,
     attr: &AttributeInfo,
@@ -2101,6 +2513,67 @@ fn write_attribute(
             let mut info = Vec::new();
             write_u2(&mut info, *class_index);
             write_u2(&mut info, *method_index);
+            write_attribute_with_info(out, name_index, &info);
+        }
+        AttributeInfo::Module(module) => {
+            let name_index = ensure_utf8(cp, "Module");
+            let mut info = Vec::new();
+            write_u2(&mut info, module.module_name_index);
+            write_u2(&mut info, module.module_flags);
+            write_u2(&mut info, module.module_version_index);
+            write_u2(&mut info, module.requires.len() as u16);
+            for require in &module.requires {
+                write_u2(&mut info, require.requires_index);
+                write_u2(&mut info, require.requires_flags);
+                write_u2(&mut info, require.requires_version_index);
+            }
+            write_u2(&mut info, module.exports.len() as u16);
+            for export in &module.exports {
+                write_u2(&mut info, export.exports_index);
+                write_u2(&mut info, export.exports_flags);
+                write_u2(&mut info, export.exports_to_index.len() as u16);
+                for target in &export.exports_to_index {
+                    write_u2(&mut info, *target);
+                }
+            }
+            write_u2(&mut info, module.opens.len() as u16);
+            for open in &module.opens {
+                write_u2(&mut info, open.opens_index);
+                write_u2(&mut info, open.opens_flags);
+                write_u2(&mut info, open.opens_to_index.len() as u16);
+                for target in &open.opens_to_index {
+                    write_u2(&mut info, *target);
+                }
+            }
+            write_u2(&mut info, module.uses_index.len() as u16);
+            for uses in &module.uses_index {
+                write_u2(&mut info, *uses);
+            }
+            write_u2(&mut info, module.provides.len() as u16);
+            for provide in &module.provides {
+                write_u2(&mut info, provide.provides_index);
+                write_u2(&mut info, provide.provides_with_index.len() as u16);
+                for provider in &provide.provides_with_index {
+                    write_u2(&mut info, *provider);
+                }
+            }
+            write_attribute_with_info(out, name_index, &info);
+        }
+        AttributeInfo::ModulePackages {
+            package_index_table,
+        } => {
+            let name_index = ensure_utf8(cp, "ModulePackages");
+            let mut info = Vec::new();
+            write_u2(&mut info, package_index_table.len() as u16);
+            for package in package_index_table {
+                write_u2(&mut info, *package);
+            }
+            write_attribute_with_info(out, name_index, &info);
+        }
+        AttributeInfo::ModuleMainClass { main_class_index } => {
+            let name_index = ensure_utf8(cp, "ModuleMainClass");
+            let mut info = Vec::new();
+            write_u2(&mut info, *main_class_index);
             write_attribute_with_info(out, name_index, &info);
         }
         AttributeInfo::BootstrapMethods { methods } => {
@@ -2453,6 +2926,9 @@ fn collect_attribute_names(attributes: &[AttributeInfo], names: &mut Vec<String>
             AttributeInfo::Synthetic => names.push("Synthetic".to_string()),
             AttributeInfo::InnerClasses { .. } => names.push("InnerClasses".to_string()),
             AttributeInfo::EnclosingMethod { .. } => names.push("EnclosingMethod".to_string()),
+            AttributeInfo::Module(_) => names.push("Module".to_string()),
+            AttributeInfo::ModulePackages { .. } => names.push("ModulePackages".to_string()),
+            AttributeInfo::ModuleMainClass { .. } => names.push("ModuleMainClass".to_string()),
             AttributeInfo::BootstrapMethods { .. } => names.push("BootstrapMethods".to_string()),
             AttributeInfo::MethodParameters { .. } => names.push("MethodParameters".to_string()),
             AttributeInfo::RuntimeVisibleAnnotations { .. } => {
@@ -2635,6 +3111,34 @@ fn ensure_class(cp: &mut Vec<CpInfo>, name: &str) -> u16 {
     }
     let name_index = ensure_utf8(cp, name);
     cp.push(CpInfo::Class { name_index });
+    (cp.len() - 1) as u16
+}
+
+fn ensure_module(cp: &mut Vec<CpInfo>, name: &str) -> u16 {
+    for (index, entry) in cp.iter().enumerate() {
+        if let CpInfo::Module { name_index } = entry
+            && let Some(CpInfo::Utf8(value)) = cp.get(*name_index as usize)
+            && value == name
+        {
+            return index as u16;
+        }
+    }
+    let name_index = ensure_utf8(cp, name);
+    cp.push(CpInfo::Module { name_index });
+    (cp.len() - 1) as u16
+}
+
+fn ensure_package(cp: &mut Vec<CpInfo>, name: &str) -> u16 {
+    for (index, entry) in cp.iter().enumerate() {
+        if let CpInfo::Package { name_index } = entry
+            && let Some(CpInfo::Utf8(value)) = cp.get(*name_index as usize)
+            && value == name
+        {
+            return index as u16;
+        }
+    }
+    let name_index = ensure_utf8(cp, name);
+    cp.push(CpInfo::Package { name_index });
     (cp.len() - 1) as u16
 }
 
@@ -4699,7 +5203,87 @@ fn read_i4(code: &[u8], pos: &mut usize) -> Result<i32, ClassWriteError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::class_reader::{AttributeInfo, ClassReader};
+    use crate::constants::*;
+    use crate::nodes::ModuleNode;
     use crate::opcodes;
+
+    fn sample_module_bytes() -> Vec<u8> {
+        let mut writer = ClassWriter::new(0);
+        writer.visit(V9, 0, ACC_MODULE, "module-info", None, &[]);
+
+        let mut module = writer.visit_module("com.example.app", ACC_OPEN, Some("1.0"));
+        module.visit_main_class("com/example/app/Main");
+        module.visit_package("com/example/api");
+        module.visit_package("com/example/internal");
+        module.visit_require("java.base", ACC_MANDATED, None);
+        module.visit_require(
+            "com.example.lib",
+            ACC_TRANSITIVE | ACC_STATIC_PHASE,
+            Some("2.1"),
+        );
+        module.visit_export("com/example/api", 0, &["com.example.consumer"]);
+        module.visit_open("com/example/internal", 0, &["com.example.runtime"]);
+        module.visit_use("com/example/spi/Service");
+        module.visit_provide("com/example/spi/Service", &["com/example/impl/ServiceImpl"]);
+        module.visit_end(&mut writer);
+
+        writer.to_bytes().expect("module-info should encode")
+    }
+
+    fn strip_module_attributes(attributes: &mut Vec<AttributeInfo>) {
+        attributes.retain(|attr| {
+            !matches!(
+                attr,
+                AttributeInfo::Module(_)
+                    | AttributeInfo::ModulePackages { .. }
+                    | AttributeInfo::ModuleMainClass { .. }
+            )
+        });
+    }
+
+    fn assert_sample_module(module: &ModuleNode) {
+        assert_eq!(module.name, "com.example.app");
+        assert_eq!(module.access_flags, ACC_OPEN);
+        assert_eq!(module.version.as_deref(), Some("1.0"));
+        assert_eq!(module.main_class.as_deref(), Some("com/example/app/Main"));
+        assert_eq!(
+            module.packages,
+            vec![
+                "com/example/api".to_string(),
+                "com/example/internal".to_string()
+            ]
+        );
+        assert_eq!(module.requires.len(), 2);
+        assert_eq!(module.requires[0].module, "java.base");
+        assert_eq!(module.requires[0].access_flags, ACC_MANDATED);
+        assert_eq!(module.requires[0].version, None);
+        assert_eq!(module.requires[1].module, "com.example.lib");
+        assert_eq!(
+            module.requires[1].access_flags,
+            ACC_TRANSITIVE | ACC_STATIC_PHASE
+        );
+        assert_eq!(module.requires[1].version.as_deref(), Some("2.1"));
+        assert_eq!(module.exports.len(), 1);
+        assert_eq!(module.exports[0].package, "com/example/api");
+        assert_eq!(
+            module.exports[0].modules,
+            vec!["com.example.consumer".to_string()]
+        );
+        assert_eq!(module.opens.len(), 1);
+        assert_eq!(module.opens[0].package, "com/example/internal");
+        assert_eq!(
+            module.opens[0].modules,
+            vec!["com.example.runtime".to_string()]
+        );
+        assert_eq!(module.uses, vec!["com/example/spi/Service".to_string()]);
+        assert_eq!(module.provides.len(), 1);
+        assert_eq!(module.provides[0].service, "com/example/spi/Service");
+        assert_eq!(
+            module.provides[0].providers,
+            vec!["com/example/impl/ServiceImpl".to_string()]
+        );
+    }
 
     #[test]
     fn test_constant_pool_deduplication() {
@@ -4789,5 +5373,89 @@ mod tests {
         let node = cw.to_class_node().expect("Should create class node");
         assert_eq!(node.name, "MyNode");
         assert_eq!(node.major_version, 52);
+    }
+
+    #[test]
+    fn test_module_info_round_trip() {
+        let bytes = sample_module_bytes();
+        let class = ClassReader::new(&bytes)
+            .to_class_node()
+            .expect("module-info should decode");
+
+        assert_eq!(class.name, "module-info");
+        assert_eq!(class.access_flags, ACC_MODULE);
+        assert_sample_module(
+            class
+                .module
+                .as_ref()
+                .expect("module descriptor should be present"),
+        );
+    }
+
+    #[test]
+    fn test_from_class_node_synthesizes_module_attributes() {
+        let bytes = sample_module_bytes();
+        let mut class = ClassReader::new(&bytes)
+            .to_class_node()
+            .expect("module-info should decode");
+
+        strip_module_attributes(&mut class.attributes);
+        let class = ClassWriter::from_class_node(class, 0)
+            .to_class_node()
+            .expect("class node should rebuild");
+
+        assert!(
+            class
+                .attributes
+                .iter()
+                .any(|attr| matches!(attr, AttributeInfo::Module(_)))
+        );
+        assert!(
+            class
+                .attributes
+                .iter()
+                .any(|attr| matches!(attr, AttributeInfo::ModulePackages { .. }))
+        );
+        assert!(
+            class
+                .attributes
+                .iter()
+                .any(|attr| matches!(attr, AttributeInfo::ModuleMainClass { .. }))
+        );
+        assert_sample_module(
+            class
+                .module
+                .as_ref()
+                .expect("module descriptor should still be present"),
+        );
+    }
+
+    #[test]
+    fn test_class_file_writer_synthesizes_module_attributes() {
+        let bytes = sample_module_bytes();
+        let mut class = ClassReader::new(&bytes)
+            .to_class_node()
+            .expect("module-info should decode");
+
+        strip_module_attributes(&mut class.attributes);
+        let bytes = ClassFileWriter::new(0)
+            .to_bytes(&class)
+            .expect("class file should rebuild");
+        let reparsed = ClassReader::new(&bytes)
+            .to_class_node()
+            .expect("rebuilt class should decode");
+
+        assert!(
+            reparsed
+                .attributes
+                .iter()
+                .any(|attr| matches!(attr, AttributeInfo::Module(_)))
+        );
+        assert_sample_module(
+            reparsed
+                .module
+                .as_ref()
+                .expect("module descriptor should still be present"),
+        );
     }
 }
